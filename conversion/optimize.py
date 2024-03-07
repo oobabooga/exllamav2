@@ -4,6 +4,11 @@ import itertools
 
 def optimize(job, save_fn, model):
 
+    has_gate = model.config.arch.mlp_gate
+    if has_gate: mlp_key_gate = model.config.arch.mlp_key_gate
+    mlp_key_up = model.config.arch.mlp_key_up
+    mlp_key_down = model.config.arch.mlp_key_down
+
     error_norm = 2.4
     max_step_size = 2
 
@@ -13,32 +18,30 @@ def optimize(job, save_fn, model):
     key_v = key + ".self_attn.v_proj"
     key_o = key + ".self_attn.o_proj"
 
-    if key + ".mlp.gate_proj" in model.modules_dict:
-        key_g = key + ".mlp.gate_proj"
-        key_u = key + ".mlp.up_proj"
-        key_d = key + ".mlp.down_proj"
+    if not model.config.arch.is_moe:
+        if has_gate: key_g = key + mlp_key_gate
+        key_u = key + mlp_key_up
+        key_d = key + mlp_key_down
         mlp_mode = "mlp"
-    elif key + ".block_sparse_moe.experts.0.w1" in model.modules_dict:
-        key_g = key + ".block_sparse_moe.experts.0.w1"
-        key_u = key + ".block_sparse_moe.experts.0.w3"
-        key_d = key + ".block_sparse_moe.experts.0.w2"
-        mlp_mode = "block_sparse_moe"
     else:
-        raise ValueError(" ## Can't find MLP keys in model")
+        if has_gate: key_g = key + mlp_key_gate.replace("*", "0")
+        key_u = key + mlp_key_up.replace("*", "0")
+        key_d = key + mlp_key_down.replace("*", "0")
+        mlp_mode = "block_sparse_moe"
 
     num_experts = model.config.num_experts if model.config.num_experts is not None else 1
     shape_q = model.modules_dict[key_q].matrix_shape()
     shape_k = model.modules_dict[key_k].matrix_shape()
     shape_v = model.modules_dict[key_v].matrix_shape()
     shape_o = model.modules_dict[key_o].matrix_shape()
-    shape_g = model.modules_dict[key_g].matrix_shape()
+    shape_g = model.modules_dict[key_g].matrix_shape() if has_gate else None
     shape_u = model.modules_dict[key_u].matrix_shape()
     shape_d = model.modules_dict[key_d].matrix_shape()
     numel_q = shape_q[0] * shape_q[1]
     numel_k = shape_k[0] * shape_k[1]
     numel_v = shape_v[0] * shape_v[1]
     numel_o = shape_o[0] * shape_o[1]
-    numel_g = shape_g[0] * shape_g[1] * num_experts
+    numel_g = shape_g[0] * shape_g[1] * num_experts if has_gate else 0
     numel_u = shape_u[0] * shape_u[1] * num_experts
     numel_d = shape_d[0] * shape_d[1] * num_experts
     numel_attn = numel_q + numel_k + numel_v + numel_o
@@ -150,19 +153,17 @@ def optimize(job, save_fn, model):
 
         return best_idx, best_add_w, best_add_v
 
-
-    # #
-    # # while True:
-    # #     b_idx, b_add_w, b_add_v = improve(f_solution, weight)
-    # #     if b_idx == -1:
-    # #         break
-    # #
-    # #     f_solution[b_idx] += 1
-    # #     weight += b_add_w
-    # #     value += b_add_v
-    # #
-    # # bpw = weight / numel
-    # # print(f" -- Score: {math.exp(value):.8f}  bpw: {bpw:.4f}")
+    # while True:
+    #     b_idx, b_add_w, b_add_v = improve(f_solution, weight)
+    #     if b_idx == -1:
+    #         break
+    #
+    #     f_solution[b_idx] += 1
+    #     weight += b_add_w
+    #     value += b_add_v
+    #
+    # bpw = weight / numel
+    # print(f" -- Score: {math.exp(value):.8f}  bpw: {bpw:.4f}")
 
     best_value = value
     prev_best_value = value

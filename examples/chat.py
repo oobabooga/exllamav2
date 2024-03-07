@@ -7,6 +7,7 @@ from exllamav2 import(
     ExLlamaV2Config,
     ExLlamaV2Cache,
     ExLlamaV2Cache_8bit,
+    ExLlamaV2Cache_Q4,
     ExLlamaV2Tokenizer,
     model_init,
 )
@@ -50,7 +51,8 @@ parser.add_argument("-maxr", "--max_response_tokens", type = int, default = 1000
 parser.add_argument("-resc", "--response_chunk", type = int, default = 250, help = "Space to reserve in context for reply, default = 250")
 parser.add_argument("-ncf", "--no_code_formatting", action = "store_true", help = "Disable code formatting/syntax highlighting")
 
-parser.add_argument("-c8", "--cache_8bit", action = "store_true", help = "Use 8-bit cache")
+parser.add_argument("-c8", "--cache_8bit", action = "store_true", help = "Use 8-bit (FP8) cache")
+parser.add_argument("-cq4", "--cache_q4", action = "store_true", help = "Use Q4 cache")
 
 parser.add_argument("-pt", "--print_timings", action = "store_true", help = "Output timings after each prompt")
 parser.add_argument("-amnesia", "--amnesia", action = "store_true", help = "Forget context after every response")
@@ -121,6 +123,8 @@ if args.draft_model_dir:
 
     if args.cache_8bit:
         draft_cache = ExLlamaV2Cache_8bit(draft_model)
+    elif args.cache_q4:
+        draft_cache = ExLlamaV2Cache_Q4(draft_model)
     else:
         draft_cache = ExLlamaV2Cache(draft_model)
 
@@ -128,6 +132,8 @@ if args.draft_model_dir:
 
 if args.cache_8bit:
     cache = ExLlamaV2Cache_8bit(model, lazy = not model.loaded)
+elif args.cache_q4:
+    cache = ExLlamaV2Cache_Q4(model, lazy = not model.loaded)
 else:
     cache = ExLlamaV2Cache(model, lazy = not model.loaded)
 
@@ -256,7 +262,7 @@ while True:
     # Send tokenized context to generator
 
     active_context = get_tokenized_context(model.config.max_seq_len - min_space_in_context)
-    generator.begin_stream(active_context, settings)
+    generator.begin_stream_ex(active_context, settings)
 
     # Stream response
 
@@ -276,7 +282,11 @@ while True:
 
         # Get response stream
 
-        chunk, eos, tokens = generator.stream()
+        res = generator.stream_ex()
+        chunk = res["chunk"]
+        eos = res["eos"]
+        tokens = res["chunk_token_ids"]
+
         if len(response_text) == 0: chunk = chunk.lstrip()
         response_text += chunk
         responses_ids[-1] = torch.cat([responses_ids[-1], tokens], dim = -1)
