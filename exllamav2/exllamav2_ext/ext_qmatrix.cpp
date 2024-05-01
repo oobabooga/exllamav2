@@ -30,7 +30,8 @@ uintptr_t make_q_matrix
     torch::Tensor gptq_scales,
     torch::Tensor gptq_g_idx,
     torch::Tensor bias,
-    torch::Tensor temp_dq
+    torch::Tensor temp_dq,
+    int max_dq_rows
 )
 {
     TORCH_CHECK_DTYPE(q_weight, kInt);
@@ -72,7 +73,11 @@ uintptr_t make_q_matrix
         TORCH_CHECK_SHAPES(q_weight, 1, bias, 0, 1);
     }
 
-    TORCH_CHECK(temp_dq.size(0) >= width * height, "Insufficient size of temp_dq buffer")
+    if (!temp_dq.device().is_meta())
+    {
+        uint64_t dq_req = (uint64_t)width * std::min((uint64_t)max_dq_rows, (uint64_t)height);
+        TORCH_CHECK(temp_dq.size(0) >= dq_req, "Insufficient size of temp_dq buffer")
+    }
 
     QMatrix* m = new QMatrix
     (
@@ -91,7 +96,8 @@ uintptr_t make_q_matrix
         gptq_scales.device().is_meta() ? NULL : (half*) gptq_scales.data_ptr(),
         gptq_g_idx.device().is_meta() ? NULL : (uint32_t*) gptq_g_idx.data_ptr(),
         bias.device().is_meta() ? NULL : (half*) bias.data_ptr(),
-        (half*) temp_dq.data_ptr()
+        (half*) temp_dq.data_ptr(),
+        max_dq_rows
     );
 
     if (m->failed) throw std::runtime_error("CUDA out of memory");
@@ -154,5 +160,51 @@ void gemm_half_q_half
         true,
         NULL,
         force_cuda
+    );
+}
+
+// Convert tensors
+
+void matrix_q4_to_fp16
+(
+    torch::Tensor in,
+    torch::Tensor scales,
+    torch::Tensor out
+)
+{
+    TORCH_CHECK(in.numel() * 2 == out.numel(), "matrix_q4_to_fp16: tensor size mismatch");
+    TORCH_CHECK_DTYPE(in, kByte);
+    TORCH_CHECK_DTYPE(out, kHalf);
+    int numel = out.numel();
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(in));
+
+    matrix_q4_to_fp16_cuda
+    (
+        (const uint8_t*) in.data_ptr(),
+        (const half*) scales.data_ptr(),
+        (half*) out.data_ptr(),
+        numel
+    );
+}
+
+void matrix_fp16_to_q4
+(
+    torch::Tensor in,
+    torch::Tensor out,
+    torch::Tensor scales
+)
+{
+    TORCH_CHECK(in.numel() == out.numel() * 2, "matrix_fp16_to_q4: tensor size mismatch");
+    TORCH_CHECK_DTYPE(in, kHalf);
+    TORCH_CHECK_DTYPE(out, kByte);
+    int numel = in.numel();
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(in));
+
+    matrix_fp16_to_q4_cuda
+    (
+        (const half*) in.data_ptr(),
+        (uint8_t*) out.data_ptr(),
+        (half*) scales.data_ptr(),
+        numel
     );
 }

@@ -17,6 +17,7 @@ from exllamav2.generator import (
 from exllamav2.attn import ExLlamaV2Attention
 from exllamav2.mlp import ExLlamaV2MLP
 from exllamav2.moe_mlp import ExLlamaV2MoEMLP
+from exllamav2.parallel_decoder import ExLlamaV2ParallelDecoder
 
 import argparse, os, math, time
 import torch
@@ -31,11 +32,13 @@ import sys
 import json
 
 torch.cuda._lazy_init()
-torch.set_printoptions(precision = 10)
+torch.set_printoptions(precision = 5, sci_mode = False, linewidth = 150)
+
 # torch.backends.cuda.matmul.allow_tf32 = True
 # torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 # torch.set_float32_matmul_precision("medium")
 
+# (!!!) NOTE: These go on top of the engine arguments that can be found in `model_init.py` (!!!)
 parser = argparse.ArgumentParser(description = "Test inference on ExLlamaV2 model")
 parser.add_argument("-ed", "--eval_dataset", type = str, help = "Perplexity evaluation dataset (.parquet file)")
 parser.add_argument("-er", "--eval_rows", type = int, default = 128, help = "Number of rows to apply from dataset")
@@ -43,7 +46,7 @@ parser.add_argument("-el", "--eval_length", type = int, default = 2048, help = "
 parser.add_argument("-et", "--eval_token", action = "store_true", help = "Evaluate perplexity on token-by-token inference using cache")
 parser.add_argument("-e8", "--eval_token_8bit", action = "store_true", help = "Evaluate perplexity on token-by-token inference using 8-bit (FP8) cache")
 parser.add_argument("-eq4", "--eval_token_q4", action = "store_true", help = "Evaluate perplexity on token-by-token inference using Q4 cache")
-parser.add_argument("-eb", "--eval_bos", action = "store_true", help = "Add BOS token to every row in perplexity test (required by Gemma and maybe other models.)")
+# parser.add_argument("-eb", "--eval_bos", action = "store_true", help = "Add BOS token to every row in perplexity test (required by Gemma and maybe other models.)")
 parser.add_argument("-p", "--prompt", type = str, help = "Generate from prompt (basic sampling settings)")
 parser.add_argument("-pnb", "--prompt_no_bos", action = "store_true", help = "Don't add BOS token to prompt")
 parser.add_argument("-t", "--tokens", type = int, default = 128, help = "Max no. tokens")
@@ -54,6 +57,7 @@ parser.add_argument("-nwu", "--no_warmup", action = "store_true", help = "Skip w
 parser.add_argument("-sl", "--stream_layers", action = "store_true", help = "Load model layer by layer (perplexity evaluation only)")
 parser.add_argument("-sp", "--standard_perplexity", choices = ["wiki2"], help = "Run standard (HF) perplexity test, stride 512 (experimental)")
 parser.add_argument("-rr", "--rank_reduce", type = str, help = "Rank-reduction for MLP layers of model, in reverse order (for experimentation)")
+parser.add_argument("-mol", "--max_output_len", type = int, help = "Set max output chunk size (incompatible with ppl tests)")
 
 # Initialize model and tokenizer
 
@@ -84,7 +88,11 @@ if args.stream_layers:
 
 model_init.check_args(args)
 model_init.print_options(args)
-model, tokenizer = model_init.init(args, allow_auto_split = True, skip_load = args.stream_layers, benchmark = True)
+model, tokenizer = model_init.init(args,
+                                   allow_auto_split = True,
+                                   skip_load = args.stream_layers,
+                                   benchmark = True,
+                                   max_output_len = args.max_output_len)
 cache = None
 
 # Auto split
@@ -123,6 +131,7 @@ if args.rank_reduce:
         while True:
             idx -= 1
             module = model.modules[idx]
+            if isinstance(module, ExLlamaV2ParallelDecoder): break
             if isinstance(module, ExLlamaV2MLP): break
             if isinstance(module, ExLlamaV2MoEMLP): break
             if idx < 0:
@@ -214,6 +223,7 @@ if args.eval_dataset or args.standard_perplexity:
 
         if args.standard_perplexity:
 
+            eval_length = args.eval_length
             if args.eval_dataset:
                 print(f" !! Note, overriding specified --eval_dataset with {args.standard_perplexity}")
 
@@ -260,7 +270,8 @@ if args.eval_dataset or args.standard_perplexity:
             eval_tokens = get_tokens(eval_rows, eval_length, eval_dataset, tokenizer)
             eval_len = [eval_tokens.shape[1]] * eval_tokens.shape[0]
 
-            if args.eval_bos:
+            # if args.eval_bos:
+            if model.config.arch.requires_bos:
                 boss = torch.full((eval_tokens.shape[0], 1), tokenizer.bos_token_id, dtype = torch.long)
                 eval_tokens = torch.cat((boss, eval_tokens[:, :-1]), dim = 1)
 
@@ -332,6 +343,9 @@ if args.eval_dataset or args.standard_perplexity:
                     else:
                         input_ids = eval_tokens[a:b, :]
                         logits = x[:, :-1, :]
+
+                        # if model.config.logit_scale != 1:
+                        #     logits.mul_(model.config.logit_scale)
 
                         logprob_sum__, logprob_count__ = ppl(input_ids, logits, eval_len[a:b])
                         logprob_sum += logprob_sum__
@@ -453,22 +467,36 @@ if args.prompt_speed:
 
         print(f" -- Measuring prompt speed...")
 
+        torch.cuda.synchronize()
+
         current_len = 128
+        step = 128
+        prompt_iters = 3
         while True:
 
-            time_begin = time.time()
+            total_time = 0
+            for i in range(prompt_iters):
 
-            cache.current_seq_len = 0
-            model.forward(ids[:, :current_len], cache, preprocess_only = True)
-            torch.cuda.synchronize()
+                torch.cuda.synchronize()
+                time_begin = time.time()
 
-            time_end = time.time()
-            tps = current_len / (time_end - time_begin)
+                cache.current_seq_len = 0
+                model.forward(ids[:, :current_len], cache, preprocess_only = True)
+
+                torch.cuda.synchronize()
+                time_end = time.time()
+                total_time += time_end - time_begin
+
+            tps = current_len / (total_time / prompt_iters)
 
             print(f" ** Length {current_len:>5} tokens: {tps:>11.4f} t/s")
 
+            if current_len >= 1024: step = 1024
+            if current_len >= 4096: step = 4096
+            if current_len >= 16384: step = 8192
+
             current_len_ = current_len
-            current_len = min(current_len + 128, model.config.max_seq_len)
+            current_len = min(current_len + step, model.config.max_seq_len)
             if current_len == current_len_: break
 
 

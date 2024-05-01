@@ -1,24 +1,24 @@
+from __future__ import annotations
 from typing import List, Union
-from exllamav2.tokenizers.base import ExLlamaV2TokenizerBase
+from exllamav2.tokenizer.base import ExLlamaV2TokenizerBase
+from tokenizers import Tokenizer
+from tokenizers import models
 
-has_tokenizers_library = False
-try:
-    from tokenizers import Tokenizer
-    from tokenizers import models
-    has_tokenizers_library = True
-except ModuleNotFoundError:
-    pass
+# Wrapper for HF Tokenizers library
 
 class ExLlamaV2TokenizerHF(ExLlamaV2TokenizerBase):
 
-    space_char_: str = " "
-    newline_char_: str = "\n"
-    vocab = None
+    space_char_: str
+    newline_char_: str
+    vocab: list[str] | None
 
     def __init__(self, tokenizer_json: str) -> None:
         super().__init__()
 
-        assert self.is_supported(), "Attempting to load HF tokenizer, but Tokenizers library is not installed"
+        self.vocab = None
+        self.space_char_ = " "
+        self.newline_char_ = "\n"
+
         self.hf_tokenizer = Tokenizer.from_file(tokenizer_json)
 
         m = self.hf_tokenizer.model
@@ -26,17 +26,11 @@ class ExLlamaV2TokenizerHF(ExLlamaV2TokenizerBase):
             self.space_char_ = self.deduce_char_map(" ")  # "Ġ"
             self.newline_char_ = self.deduce_char_map("\n")  # "Ċ"
 
-
-    @staticmethod
-    def is_supported():
-        global has_tokenizers_library
-        return has_tokenizers_library
-
-    def unk_id(self) -> int or None: return None
+    def unk_id(self) -> int or None: return None if self.unk_token() is None else self.piece_to_id(self.unk_token())
     def pad_id(self) -> int or None: return None
     def bos_id(self) -> int or None: return None
     def eos_id(self) -> int or None: return None
-    def unk_token(self) -> str or None: return None
+    def unk_token(self) -> str or None: return self.hf_tokenizer.model.unk_token
     def pad_token(self) -> str or None: return None
     def bos_token(self) -> str or None: return None
     def eos_token(self) -> str or None: return None

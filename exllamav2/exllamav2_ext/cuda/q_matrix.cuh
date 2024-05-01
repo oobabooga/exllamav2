@@ -40,6 +40,7 @@ public:
     half* cuda_bias = NULL;
 
     half* temp_dq;
+    int max_dq_rows;
 
     bool failed;
 
@@ -64,16 +65,47 @@ public:
 
         half* bias,
 
-        half* _temp_dq
+        half* _temp_dq,
+        const int _max_dq_rows
     );
 
     ~QMatrix();
 
-    void reconstruct(half* out);
+    void reconstruct(half* out, int row_a = 0, int row_b = 0);
     bool make_sequential(const uint32_t* cpu_g_idx);
 
 private:
 
 };
+
+void matrix_q4_to_fp16_cuda
+(
+    const uint8_t* in_ptr,
+    const half* scales_ptr,
+    half* out_ptr,
+    int numel
+);
+
+void matrix_fp16_to_q4_cuda
+(
+    const half* in_ptr,
+    uint8_t* out_ptr,
+    half* scales_ptr,
+    int numel
+);
+
+void matrix_fp8_to_fp16_cuda
+(
+    const uint8_t* in_ptr,
+    half* out_ptr,
+    int numel
+);
+
+void matrix_fp16_to_fp8_cuda
+(
+    const half* in_ptr,
+    uint8_t* out_ptr,
+    int numel
+);
 
 #endif

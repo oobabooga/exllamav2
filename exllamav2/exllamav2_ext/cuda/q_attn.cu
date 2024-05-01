@@ -2,6 +2,7 @@
 #include "q_gemm.cuh"
 #include "rms_norm.cuh"
 #include "layer_norm.cuh"
+#include "head_norm.cuh"
 #include "rope.cuh"
 #include "util.cuh"
 #include "lora.cuh"
@@ -88,7 +89,11 @@ QAttn::QAttn
     int _num_heads,
     int _num_kv_heads,
     int _head_dim,
-    int _max_seq_len
+    int _max_seq_len,
+    bool _has_residual,
+    bool _neox_style,
+    half* _q_norm,
+    half* _k_norm
 ):
     layernorm(_layernorm),
     layernorm_bias(_layernorm_bias),
@@ -108,7 +113,11 @@ QAttn::QAttn
     num_heads(_num_heads),
     num_kv_heads(_num_kv_heads),
     head_dim(_head_dim),
-    max_seq_len(_max_seq_len)
+    max_seq_len(_max_seq_len),
+    has_residual(_has_residual),
+    neox_style(_neox_style),
+    q_norm(_q_norm),
+    k_norm(_k_norm)
 {
 }
 
@@ -133,21 +142,49 @@ void QAttn::forward_cuda_1
     half* lora_temp
 )
 {
-    if (layernorm_is_rms)
-        rms_norm_cuda(x, layernorm, temp_state, norm_epsilon, q_len * batch_size, hidden_size);
-    else
-        layer_norm_cuda(x, layernorm, layernorm_bias, temp_state, norm_epsilon, q_len * batch_size, hidden_size);
+    half* norm_state = x;
 
-    gemm_half_q_half_cuda(cublas_handle, temp_state, q_proj, temp_q, q_len * batch_size, q_proj->width, hidden_size, true, temp_dq);
-    gemm_half_q_half_cuda(cublas_handle, temp_state, k_proj, temp_k, q_len * batch_size, k_proj->width, hidden_size, true, temp_dq);
-    gemm_half_q_half_cuda(cublas_handle, temp_state, v_proj, temp_v, q_len * batch_size, v_proj->width, hidden_size, true, temp_dq);
+    if (layernorm)
+    {
+        if (layernorm_is_rms)
+            rms_norm_cuda(x, layernorm, temp_state, norm_epsilon, q_len * batch_size, hidden_size);
+        else
+            layer_norm_cuda(x, layernorm, layernorm_bias, temp_state, norm_epsilon, q_len * batch_size, hidden_size);
+        norm_state = temp_state;
+    }
 
-    apply_loras_cuda(cublas_handle, q_proj_lora, loras, q_proj, temp_state, temp_q, lora_temp, q_len * batch_size);
-    apply_loras_cuda(cublas_handle, k_proj_lora, loras, k_proj, temp_state, temp_k, lora_temp, q_len * batch_size);
-    apply_loras_cuda(cublas_handle, v_proj_lora, loras, v_proj, temp_state, temp_v, lora_temp, q_len * batch_size);
+    gemm_half_q_half_cuda(cublas_handle, norm_state, q_proj, temp_q, q_len * batch_size, q_proj->width, hidden_size, true, temp_dq);
+    gemm_half_q_half_cuda(cublas_handle, norm_state, k_proj, temp_k, q_len * batch_size, k_proj->width, hidden_size, true, temp_dq);
+    gemm_half_q_half_cuda(cublas_handle, norm_state, v_proj, temp_v, q_len * batch_size, v_proj->width, hidden_size, true, temp_dq);
 
-    rope_cuda(temp_q, sin, cos, batch_size, q_len * num_heads,    head_dim, num_heads,    past_len, past_lens);
-    rope_cuda(temp_k, sin, cos, batch_size, q_len * num_kv_heads, head_dim, num_kv_heads, past_len, past_lens);
+    if (q_norm)
+        head_norm_cuda(temp_q, q_norm, NULL, temp_q, norm_epsilon, q_len * batch_size, num_heads, head_dim);
+
+    if (k_norm)
+        head_norm_cuda(temp_k, k_norm, NULL, temp_k, norm_epsilon, q_len * batch_size, num_kv_heads, head_dim);
+
+    apply_loras_cuda(cublas_handle, q_proj_lora, loras, q_proj, norm_state, temp_q, lora_temp, q_len * batch_size);
+    apply_loras_cuda(cublas_handle, k_proj_lora, loras, k_proj, norm_state, temp_k, lora_temp, q_len * batch_size);
+    apply_loras_cuda(cublas_handle, v_proj_lora, loras, v_proj, norm_state, temp_v, lora_temp, q_len * batch_size);
+
+//    rope_cuda(temp_q, sin, cos, batch_size, q_len * num_heads,    head_dim, num_heads,    past_len, past_lens);
+//    rope_cuda(temp_k, sin, cos, batch_size, q_len * num_kv_heads, head_dim, num_kv_heads, past_len, past_lens);
+    rope_cuda_qk
+    (
+        temp_q,
+        temp_k,
+        sin,
+        cos,
+        batch_size,
+        q_len * num_heads,
+        q_len * num_kv_heads,
+        head_dim,
+        num_heads,
+        num_kv_heads,
+        past_len,
+        past_lens,
+        neox_style
+    );
 }
 
 void QAttn::forward_cuda_2
@@ -161,7 +198,7 @@ void QAttn::forward_cuda_2
     half* lora_temp
 )
 {
-    gemm_half_q_half_cuda(cublas_handle, attn_output, o_proj, hidden_state, q_len * batch_size, o_proj->width, o_proj->height, false, temp_dq);
+    gemm_half_q_half_cuda(cublas_handle, attn_output, o_proj, hidden_state, q_len * batch_size, o_proj->width, o_proj->height, !has_residual, temp_dq);
 
     apply_loras_cuda(cublas_handle, o_proj_lora, loras, o_proj, attn_output, hidden_state, lora_temp, q_len * batch_size);
 }

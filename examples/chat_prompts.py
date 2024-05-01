@@ -100,6 +100,91 @@ class PromptFormat_llama(PromptFormat):
         return True
 
 
+class PromptFormat_llama3(PromptFormat):
+
+    description = "Llama3-instruct models"
+
+    def __init__(self):
+        super().__init__()
+        pass
+
+    def default_system_prompt(self):
+        return \
+            """Assist users with tasks and answer questions to the best of your knowledge. Provide helpful and informative """ + \
+            """responses. Be conversational and engaging. If you are unsure or lack knowledge on a topic, admit it and try """ + \
+            """to find the answer or suggest where to find it. Keep responses concise and relevant. Follow ethical """ + \
+            """guidelines and promote a safe and respectful interaction."""
+
+    def first_prompt(self):
+        return \
+            """<|start_header_id|>system<|end_header_id|>\n\n""" + \
+            """<|system_prompt|><|eot_id|>""" + \
+            """<|start_header_id|>user<|end_header_id|>\n\n""" + \
+            """<|user_prompt|><|eot_id|>""" + \
+            """<|start_header_id|>assistant<|end_header_id|>"""
+
+    def subs_prompt(self):
+        return \
+            """<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n""" + \
+            """<|user_prompt|><|eot_id|>""" + \
+            """<|start_header_id|>assistant<|end_header_id|>"""
+
+    def stop_conditions(self, tokenizer):
+        return \
+            [tokenizer.eos_token_id,
+             tokenizer.single_id("<|eot_id|>"),
+             tokenizer.single_id("<|start_header_id|>")]
+
+    def encoding_options(self):
+        return False, False, True
+
+    def print_extra_newline(self):
+        return True
+
+
+class PromptFormat_phi3(PromptFormat):
+
+    description = "Phi3-instruct models"
+
+    def __init__(self):
+        super().__init__()
+        pass
+
+    def default_system_prompt(self):
+        return \
+            """You are a helpful AI assistant."""
+
+    def first_prompt(self):
+        return \
+            """<s><|system|>\n""" + \
+            """<|system_prompt|>""" + \
+            """<|end|>\n""" + \
+            """<|user|>\n""" + \
+            """<|user_prompt|><|end|>\n""" + \
+            """<|assistant|>\n"""
+
+    def subs_prompt(self):
+        return \
+            """<|end|>\n""" + \
+            """<|user|>\n""" + \
+            """<|user_prompt|>""" + \
+            """<|end|>\n""" + \
+            """<|assistant|>\n"""
+
+    def stop_conditions(self, tokenizer):
+        return \
+            [tokenizer.eos_token_id,
+             tokenizer.single_id("<|end|>"),
+             tokenizer.single_id("<|assistant|>"),
+             tokenizer.single_id("<|endoftext|>")]
+
+    def encoding_options(self):
+        return False, False, True
+
+    def print_extra_newline(self):
+        return True
+
+
 class PromptFormat_codellama(PromptFormat_llama):
 
     description = "CodeLlama-instruct"
@@ -385,10 +470,54 @@ class PromptFormat_gemma(PromptFormat):
         return True
 
 
+class PromptFormat_cohere(PromptFormat):
+    description = "Cohere"
+
+    def __init__(self):
+        super().__init__()
+        pass
+
+    def default_system_prompt(self):
+        return \
+            f"""You are a helpful AI assistant."""
+
+    def first_prompt(self):
+        return \
+            """<BOS_TOKEN>""" + \
+            """<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>""" + \
+            """<|system_prompt|>""" + \
+            """<|END_OF_TURN_TOKEN|>""" + \
+            """<|START_OF_TURN_TOKEN|><|USER_TOKEN|>""" + \
+            """<|user_prompt|>""" + \
+            """<|END_OF_TURN_TOKEN|>""" + \
+            """<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"""
+
+    def subs_prompt(self):
+        return \
+            """<|END_OF_TURN_TOKEN|>""" + \
+            """<|START_OF_TURN_TOKEN|><|USER_TOKEN|>""" + \
+            """<|user_prompt|>""" + \
+            """<|END_OF_TURN_TOKEN|>""" + \
+            """<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>"""
+
+    def stop_conditions(self, tokenizer):
+        return \
+            [tokenizer.eos_token_id,
+             """<|END_OF_TURN_TOKEN|>""",
+             ]
+
+    def encoding_options(self):
+        return False, False, True
+
+    def print_extra_newline(self):
+        return True
+
+
 prompt_formats = \
 {
     "raw": PromptFormat_raw,
     "llama": PromptFormat_llama,
+    "llama3": PromptFormat_llama3,
     "codellama": PromptFormat_codellama,
     "chatml": PromptFormat_chatml,
     "tinyllama": PromptFormat_tinyllama,
@@ -398,4 +527,6 @@ prompt_formats = \
     "openchat": PromptFormat_openchat,
     "nous": PromptFormat_nous,
     "gemma": PromptFormat_gemma,
+    "cohere": PromptFormat_cohere,
+    "phi3": PromptFormat_phi3,
 }

@@ -5,12 +5,18 @@
 #include <vector>
 #include <queue>
 #include <utility>
+#include "avx2_target.h"
+#include "sampling_avx2.h"
+#include "profiling.h"
 
 const int top_k_heap_threshold = 500;
 
 bool* g_rep_mask = NULL;
 int g_vocab_size = 0;
 
+// Repetition penalty
+
+AVX2_TARGET_OPTIONAL
 void apply_rep_penalty_cpu
 (
     const int vocab_size,
@@ -24,6 +30,8 @@ void apply_rep_penalty_cpu
     float* logits
 )
 {
+    profile_start("apply_rep_penalty_cpu");
+
     // Map of which logits have already had penalties applied
 
     if (vocab_size > g_vocab_size)
@@ -93,9 +101,12 @@ void apply_rep_penalty_cpu
             pres_p += d_pres_p;
         }
     }
+
+    profile_stop();
 }
 
-void softmax_cpu
+AVX2_TARGET_OPTIONAL
+void softmax_cpu_nonavx2
 (
     const int vocab_size,
     const float temperature,
@@ -105,6 +116,8 @@ void softmax_cpu
     float* output
 )
 {
+    profile_start("softmax_cpu");
+
     float esum = 0.0f;
     float itemp = 1.0f / temperature;
     float maxl = -1e38;
@@ -136,6 +149,8 @@ void softmax_cpu
         else output[i] = 0.0f;
     }
 
+    profile_stop();
+
 //    printf("Softmax:");
 //    float summ = 0.0f;
 //    for (int i = 0; i < vocab_size; i++)
@@ -150,6 +165,23 @@ void softmax_cpu
 //    printf("sum: %f\n\n", summ);
 }
 
+void softmax_cpu
+(
+    const int vocab_size,
+    const float temperature,
+    const float* logits,
+    const bool* logits_filter,
+    const float exponent,
+    float* output
+)
+{
+    if (is_avx2_supported())
+        return softmax_cpu_avx2(vocab_size, temperature, logits, logits_filter, exponent, output);
+    else
+        return softmax_cpu_nonavx2(vocab_size, temperature, logits, logits_filter, exponent, output);
+}
+
+AVX2_TARGET_OPTIONAL
 int post_softmax_temperature
 (
     const int num_candidates,
@@ -161,6 +193,8 @@ int post_softmax_temperature
     float temp_exponent = 1.0f
 )
 {
+    profile_start("post_softmax_temperature");
+
     if (max_temp > min_temp)
     {
         // Calculate entropy of the softmax probabilities
@@ -213,21 +247,27 @@ int post_softmax_temperature
 //        DBGIF(i, temp_probs[i]);
 //    printf("\n");
 
+    profile_stop();
     return num_candidates;
 }
 
+AVX2_TARGET_OPTIONAL
 void normalize_cpu
 (
     const int num_candidates,
     float* probs
 )
 {
+    profile_start("normalize_cpu");
+
     float sum = 0.0f;
     #pragma unroll(32)
     for (int i = 0; i < num_candidates; i++) sum += probs[i];
     float isum = 1.0f / sum;
     #pragma unroll(32)
     for (int i = 0; i < num_candidates; i++) probs[i] *= isum;
+
+    profile_stop();
 }
 
 template <typename T>
@@ -249,6 +289,7 @@ inline bool cmp_desc(const float& a, const float& b)
 }
 
 template <bool (*cmp_func)(const float&, const float&)>
+AVX2_TARGET_OPTIONAL
 void quicksort_with_idx
 (
     float* arr,
@@ -344,6 +385,7 @@ void quicksort_with_idx
 
 // Discard tiny probabilities, improves performance when temperature is very low
 
+AVX2_TARGET_OPTIONAL
 int pre_sort_descending
 (
     const int num_candidates,
@@ -368,6 +410,7 @@ int pre_sort_descending
     return i;
 }
 
+AVX2_TARGET_OPTIONAL
 int sort_descending
 (
     const int num_candidates,
@@ -386,6 +429,7 @@ int sort_descending
     return pre;
 }
 
+AVX2_TARGET_OPTIONAL
 int top_k_cpu
 (
     const int num_candidates,
@@ -394,7 +438,7 @@ int top_k_cpu
     int top_k
 )
 {
-    //TIME_START;
+    profile_start("top_k_cpu");
 
     // Special case greedy sampling
 
@@ -450,11 +494,11 @@ int top_k_cpu
         sort_descending(num_candidates, temp_probs, temp_indices, top_k);
     }
 
-    //TIME_STOP;
-
+    profile_stop();
     return top_k;
 }
 
+AVX2_TARGET_OPTIONAL
 int top_p_cpu
 (
     const int num_candidates,
@@ -463,9 +507,9 @@ int top_p_cpu
     float top_p
 )
 {
-    std::priority_queue<std::pair<float, int>, std::vector<std::pair<float, int>>, std::greater<std::pair<float, int>>> min_heap;
+    profile_start("top_p_cpu");
 
-    //TIME_START;
+    std::priority_queue<std::pair<float, int>, std::vector<std::pair<float, int>>, std::greater<std::pair<float, int>>> min_heap;
 
     float min_p = 1e-6;
 
@@ -495,11 +539,11 @@ int top_p_cpu
         min_heap.pop();
     }
 
-    //TIME_STOP;
-
+    profile_stop();
     return k;
 }
 
+AVX2_TARGET_OPTIONAL
 int keep_threshold
 (
     const int num_candidates,
@@ -533,6 +577,8 @@ int top_a_cpu
     float top_a
 )
 {
+    profile_start("top_a_cpu");
+
     // Find top probability
     float top_prob = temp_probs[0];
     for (int i = 1; i < num_candidates; i++)
@@ -544,9 +590,11 @@ int top_a_cpu
     // Use the keep_threshold function to keep only probabilities above the threshold
     int n = keep_threshold(num_candidates, temp_probs, temp_indices, threshold);
 
+    profile_stop();
     return n;
 }
 
+AVX2_TARGET_OPTIONAL
 int min_p_cpu
 (
     const int num_candidates,
@@ -555,7 +603,7 @@ int min_p_cpu
     float min_p
 )
 {
-    //TIME_START;
+    profile_start("min_p_cpu");
 
     float top_prob = temp_probs[0];
     for (int i = 1; i < num_candidates; i++)
@@ -564,11 +612,11 @@ int min_p_cpu
     float threshold = top_prob * min_p;
     int n = keep_threshold(num_candidates, temp_probs, temp_indices, threshold);
 
-    //TIME_STOP;
-
+    profile_stop();
     return n;
 }
 
+AVX2_TARGET_OPTIONAL
 int tfs_cpu
 (
     const int num_candidates,
@@ -577,7 +625,7 @@ int tfs_cpu
     float tfs
 )
 {
-    //TIME_START;
+    profile_start("tfs_cpu");
 
     if (num_candidates < 3) return num_candidates;  // Discrete 2nd derivative undefined
 
@@ -613,9 +661,11 @@ int tfs_cpu
     //TIME_STOP;
 
     free(derivative);
+    profile_stop();
     return k;
 }
 
+AVX2_TARGET_OPTIONAL
 int mirostat_pre_cpu
 (
     const int num_candidates,
@@ -626,7 +676,7 @@ int mirostat_pre_cpu
     float mirostat_eta
 )
 {
-    //TIME_START;
+    profile_start("mirostat_pre_cpu");
 
     // If mu not yet initialized, initialize here
 
@@ -642,8 +692,7 @@ int mirostat_pre_cpu
     for (; k < nc; k++)
         if (temp_probs[k] < target_prob) break;
 
-    //TIME_STOP;
-
+    profile_stop();
     return k;
 }
 
@@ -657,6 +706,8 @@ float mirostat_post_cpu
     float mirostat_eta
 )
 {
+    profile_start("mirostat_post_cpu");
+
     // If mu not yet initializer, initialize here
 
     float mu = mirostat_mu;
@@ -667,9 +718,11 @@ float mirostat_post_cpu
     float observed_surprise = -log2(temp_probs[0]);
     mu += mirostat_eta * (mirostat_tau - observed_surprise);
 
+    profile_stop();
     return mu;
 }
 
+AVX2_TARGET_OPTIONAL
 int typical_cpu
 (
     const int num_candidates,
@@ -678,7 +731,7 @@ int typical_cpu
     float typical
 )
 {
-    //TIME_START;
+    profile_start("typical_cpu");
 
     const float epsilon = 1e-10;
 
@@ -728,12 +781,13 @@ int typical_cpu
     free(entropy_dev_order);
     free(temp_indices_2);
 
-    //TIME_STOP;
-
     if (num == 0) num = 1;
+
+    profile_stop();
     return num;
 }
 
+AVX2_TARGET_OPTIONAL
 int multinomial_cpu
 (
     const int num_candidates,
@@ -752,6 +806,8 @@ int multinomial_cpu
 //    }
 //    printf("-----------------\n");
 
+    profile_start("multinomial_cpu");
+
     int idx = 0;
     float accum = temp_probs[idx];
 
@@ -766,7 +822,6 @@ int multinomial_cpu
     swap<float>(temp_probs[0], temp_probs[idx]);
     swap<int>(temp_indices[0], temp_indices[idx]);
 
+    profile_stop();
     return 1;
 }
-
-

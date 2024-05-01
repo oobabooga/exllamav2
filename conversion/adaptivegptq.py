@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import gc
 import torch
 from torch import nn
@@ -67,15 +69,19 @@ class AdaptiveQuantizer:
         self.scale = qscale_tw * best_p
         self.qscale_max = qscale_max_t * best_p
 
+        # Make sure scales are rounded correctly for sanity test
+        prescale = torch.tensor([1 / 256], dtype = torch.half, device = self.scale.device)
+        self.scale = ((self.qscale * self.qscale).to(torch.half) * (self.qscale_max.half() * prescale)).float()
+
 
 class AdaptiveGPTQ:
 
-    percdamp: float = 0.07
+    percdamp: float = 0.12
 
     layer: nn.Linear
     device: torch.device
 
-    group_size: int
+    group_size: int | dict
     bits: list
     bits_groups: list
     scale_bits: int
@@ -86,23 +92,26 @@ class AdaptiveGPTQ:
     hessian: torch.tensor
     total_groups: int
 
-    perm: torch.tensor = None
-    perm_cpu: torch.tensor = None
-    invperm: torch.tensor = None
+    perm: torch.Tensor | None
+    perm_cpu: torch.Tensor | None
+    invperm: torch.Tensor | None
 
     # g_idx: torch.tensor = None
-    scale: torch.tensor = None
-    qscale: torch.tensor = None
-    qscale_max: torch.tensor = None
-    qweight: torch.tensor = None
-    qgroups: torch.tensor = None
+    scale: torch.Tensor | None
+    qscale: torch.Tensor | None
+    qscale_max: torch.Tensor | None
+    qweight: torch.Tensor | None
+    qgroups: torch.Tensor | None
 
-    quant: torch.tensor = None
-    weights: torch.tensor = None
-    hessian: torch.tensor = None
-    hessian_inv: torch.tensor = None
+    quant: torch.Tensor | None
+    weights: torch.Tensor | None
+    hessian: torch.Tensor | None
+    hessian_inv: torch.Tensor | None
     num_samples: int = 0
     num_batches: int = 0
+
+    quant_device: int = 0
+    hessian_device: int = 0
 
 
     def __init__(self,
@@ -114,10 +123,24 @@ class AdaptiveGPTQ:
         self.rows = self.layer.weight.data.shape[1]
         self.columns = self.layer.weight.data.shape[0]
 
-        self.weights = self.layer.weight.data.T.clone().float().contiguous()
+        # self.weights = self.layer.weight.data.T.clone().float().contiguous()
+        self.weights = None
         self.hessian = None
         self.num_samples = 0
         self.num_batches = 0
+
+        self.perm = None
+        self.perm_cpu = None
+        self.inv_perm = None
+
+        self.scale = None
+        self.qscale = None
+        self.qscale_max = None
+        self.qweight = None
+        self.qgroups = None
+
+        self.quant_device = 0
+        self.hessian_device = 0
 
 
     def drop_buffers(self):
@@ -170,61 +193,48 @@ class AdaptiveGPTQ:
 
         self.total_groups = groups
 
-        # if isinstance(bits, list):
-        #
-        #     self.bits = bits
-        #     g128 = (self.rows + 128 - 1) // 128
-        #     self.bits_groups = [max(round(g128 * p), 1) * 128 // self.group_size for p in bits_prop]
-        #     e = sum(self.bits_groups) - self.total_groups
-        #     self.bits_groups[-1] -= e
-        #
-        # else:
-        #
-        #     self.bits = [bits]
-        #     self.bits_groups = [self.total_groups]
-
-
-    # def num_bits(self, subtract_columns = 0):
-    #
-    #     gi = self.g_idx.numel() * 32
-    #     qs = self.qscale.numel() * self.scale_bits
-    #     qss = self.qscale_max.numel() * 16
-    #
-    #     w = 0
-    #     tr = self.rows
-    #     for g, b in zip(self.bits_groups, self.bits):
-    #
-    #         c = self.columns - subtract_columns
-    #         r = self.group_size * g
-    #         if r > tr: r = tr
-    #         tr -= r
-    #         w += r * c * b
-    #
-    #     return w + gi + qs + qss
-
 
     def add_batch(self, inputs):
 
         with torch.inference_mode():
 
+            # dim = inputs.shape[-1]
+            # inputs = inputs.view((-1, dim)).float().T.to("cuda:0")
+            # ns = 1
+            #
+            # if self.hessian is None:
+            #     self.hessian = torch.zeros((dim, dim), device = self.device, dtype = torch.float)
+            # else:
+            #     self.hessian.mul_(self.num_samples / (self.num_samples + ns))
+            # self.num_samples += ns
+            # inputs.mul_(math.sqrt(2 / self.num_samples))
+            # self.hessian.addmm_(inputs, inputs.T)
+
+            # self.num_batches += 1
+            # num_samples = len(inputs)
+            # # inputs = torch.cat(inputs, dim = 0)
+            # inputs = inputs.view((-1, inputs.shape[-1])).float().T.to("cuda:0")
+            # inputs *= math.sqrt(2 / num_samples)
+            # self.hessian += inputs.matmul(inputs.T)
+
             if self.hessian is None:
                 self.hessian = torch.zeros((self.rows, self.rows), device=self.device, dtype=torch.float)
 
             self.num_batches += 1
-            num_samples = len(inputs)
-            # inputs = torch.cat(inputs, dim = 0)
-            inputs = inputs.view((-1, inputs.shape[-1])).float().T.to("cuda:0")
-            inputs *= math.sqrt(2 / num_samples)
-            self.hessian += inputs.matmul(inputs.T)
+            inputs = inputs.view((-1, inputs.shape[-1])).float().to("cuda:0")
+            self.hessian.addmm_(inputs.T, inputs)
 
 
-    def prepare(self):
+    def prepare(self, no_h_inv = False):
 
         with torch.inference_mode():
 
             self.hessian /= self.num_batches
-
             diagonal = torch.diag(self.hessian)
+
+            # Prepare weights
+
+            self.weights = self.layer.weight.data.cpu().T.clone().float().contiguous()
 
             # Zero weights that have no impact. Disabling this since it feels a little drastic based on just the calibration
             # data. It likely never triggers, anyway.
@@ -237,9 +247,16 @@ class AdaptiveGPTQ:
 
             self.perm = torch.argsort(diagonal, descending = True)
             self.perm_cpu = self.perm.cpu()
-            self.weights = self.weights[self.perm, :]
-            hessian = self.hessian[self.perm][:, self.perm]
-            self.hessian = None
+            self.weights = self.weights[self.perm_cpu, :]
+
+            if self.hessian.numel() > 6e8:
+                hessian_cpu = self.hessian.cpu()
+                self.hessian = None
+                hessian = hessian_cpu[self.perm_cpu][:, self.perm_cpu]
+                hessian = hessian.to("cuda:0")
+            else:
+                hessian = self.hessian[self.perm][:, self.perm]
+                self.hessian = None
 
             # In case numerical errors have caused some asymmetry in H, assume it's close to symmetrical and force it.
             # (Doesn't seem to be needed)
@@ -256,46 +273,47 @@ class AdaptiveGPTQ:
             # Inverse of H
 
             attempts = 0
-            while True:
+            while not no_h_inv:
 
                 try:
 
                     d = torch.arange(self.rows, device = self.device)
                     hessian[d, d] += damp
 
-                    # Dump condition number and smallest eigenvalue (should be positive)
+                    current_device = self.hessian_device
+                    max_devices = torch.cuda.device_count()
 
-                    # fro_norm_hessian = torch.norm(hessian, p = 'fro')
-                    # fro_norm_inv = torch.norm(torch.linalg.inv(hessian), p = 'fro')
-                    # cond_number = fro_norm_hessian * fro_norm_inv
-                    # print(cond_number)
+                    done = False
+                    fail_device = False
+                    while not done:
+                        try:
+                            hessian = hessian.to(torch.device(current_device))
 
-                    # eigenvalues = torch.linalg.eigvalsh(hessian)
-                    # is_pd = torch.all(eigenvalues > 0)
-                    # print(is_pd)
-                    # print(torch.min(eigenvalues))
+                            hessian_inv = torch.linalg.cholesky(hessian)
+                            hessian_inv = torch.cholesky_inverse(hessian_inv)
 
-                    hessian_inv = torch.linalg.cholesky(hessian)
-                    hessian_inv = torch.cholesky_inverse(hessian_inv)
+                            # The Cholesky inverse will sometimes fail to compute due to accumulated rounding errors when H
+                            # is very large (e.g. 70B MLP down proj) and a lot of calibration data is used (e.g. 100 rows of
+                            # 4096 tokens). This won't always throw an exception and sometimes just results in a NaN tensor.
 
-                    # The Cholesky inverse will sometimes fail to compute due to accumulated rounding errors when H
-                    # is very large (e.g. 70B MLP down proj) and a lot of calibration data is used (e.g. 100 rows of
-                    # 4096 tokens). This won't always throw an exception and sometimes just results in a NaN tensor.
+                            if torch.any(torch.isnan(hessian_inv)): raise RuntimeError
 
-                    if torch.any(torch.isnan(hessian_inv)): raise RuntimeError
+                            # Test inversion
 
-                    # Test inversion
+                            hessian_inv = torch.linalg.cholesky(hessian_inv, upper = True)
+                            hessian_inv = hessian_inv.contiguous()
 
-                    # test = hessian_inv @ hessian
-                    # test.sub_(torch.eye(test.size(0), device = test.device, dtype = test.dtype))
-                    # test **= 2
-                    # test = test.mean()
-                    # print(test)
+                            done = True
+                            break
 
-                    hessian_inv = torch.linalg.cholesky(hessian_inv, upper = True)
-                    hessian_inv = hessian_inv.contiguous()
+                        except torch.cuda.OutOfMemoryError as e:
+                            current_device += 1
+                            print(f" !! Out of memory (H), moving to device {current_device}")
+                            if current_device == max_devices:
+                                raise e
+                            self.hessian_device = current_device
 
-                    break
+                    if done: break
 
                 except RuntimeError as runtime_error:
 
@@ -311,95 +329,226 @@ class AdaptiveGPTQ:
                     if attempts == 10:
                         raise ValueError("Hessian is not invertible")
 
-            self.hessian_inv = hessian_inv
+            # Swap H to system RAM
+
+            self.hessian_inv = None if no_h_inv else hessian_inv.cpu()
             self.hessian = None
+
 
     def reuse_h(self, other):
 
         with torch.inference_mode():
 
+            # Prepare weights
+
+            self.weights = self.layer.weight.data.cpu().T.clone().float().contiguous()
+
             self.hessian_inv = other.hessian_inv
             self.hessian = None
             self.perm = other.perm
             self.perm_cpu = other.perm_cpu
-            self.weights = self.weights[self.perm, :]
+            self.weights = self.weights[self.perm_cpu, :]
+
+
+    def quantize_rtn_inplace(self, keep_qweight = False, apply = False):
+        assert apply and keep_qweight
+
+        with torch.inference_mode():
+
+            current_device = self.quant_device
+            max_devices = torch.cuda.device_count()
+
+            weights_cpu = self.weights.cpu().contiguous()
+
+            done = False
+            while not done:
+
+                try:
+
+                    weights = weights_cpu.to(torch.device(current_device))
+                    self.qweight = torch.zeros_like(weights, dtype = torch.short, device = torch.device(current_device))
+
+                    num_groups = 0
+                    for bits_idx in range(len(self.bits)):
+                        num_groups += self.bits_groups[bits_idx]
+
+                    scale = []
+                    qscale = []
+                    qscale_max = torch.empty((num_groups,), dtype = torch.float, device = torch.device(current_device))
+                    qgroups = []
+
+                    group_idx = 0
+                    group_idx_list = []
+
+                    b = 0
+                    for bits_idx, bits in enumerate(self.bits):
+                        quantizer = AdaptiveQuantizer(bits = bits, scale_bits = self.scale_bits)
+
+                        for group in range(self.bits_groups[bits_idx]):
+                            a = b
+                            b = min(a + self.group_size[bits], self.rows)
+
+                            qgroups.append(bits)
+                            qgroups.append(0)
+
+                            quantizer.find_params(weights[a : b, :])
+                            scale.append(quantizer.scale)
+                            qscale.append(quantizer.qscale)
+                            qscale_max[group_idx] = quantizer.qscale_max
+
+                            ext_c.quantize_range_inplace(weights,
+                                                         quantizer.scale,
+                                                         self.qweight,
+                                                         quantizer.qzero,
+                                                         quantizer.maxq,
+                                                         a,
+                                                         b)
+
+                            group_idx_list += [group_idx] * (b - a)
+                            group_idx += 1
+
+                    done = True
+
+                except torch.cuda.OutOfMemoryError as e:
+                    current_device += 1
+                    print(f" !! Out of memory (Q), moving to device {current_device}")
+                    if current_device == max_devices:
+                        raise e
+                    self.quant_device = current_device
+
+            # Create g_idx to store inverse activation order
+
+            self.invperm = torch.argsort(self.perm).to("cuda:0")
+
+            # Store scales
+
+            self.scale = torch.stack(scale, dim = 0).to("cuda:0")
+            self.qscale = torch.stack(qscale, dim = 0).to("cuda:0")
+            self.qscale_max = qscale_max.to(torch.float16).to("cuda:0")
+            self.qgroups = torch.tensor(qgroups, dtype = torch.short).to("cuda:0")
+
+            # I love Python
+
+            scale = None
+            qscale = None
+            qscale_max = None
+            qgroups = None
+            group_idx_list = None
+
+            qc = weights.cpu()
+            qc = qc.to(torch.half)
+            invperm = self.invperm.cpu()
+            q = qc[invperm, :].T
+            q = q.reshape(weights.T.shape)
+
+            dev = weights.device
+            weights = None
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            q = q.to(dev)
+            self.layer.weight.data = q
+            self.weights = q.T
 
 
     def quantize(self, keep_qweight = False, apply = False):
 
         with torch.inference_mode():
 
-            if apply:
-                weights = self.weights
-                self.layer.weight.data = torch.zeros((1, 1), dtype = torch.float32, device = weights.device)
-            else:
-                weights = self.weights.clone()
+            current_device = self.quant_device
+            max_devices = torch.cuda.device_count()
 
-            self.quant = torch.zeros_like(self.weights)
+            weights_cpu = self.weights.cpu()
 
-            if keep_qweight:
-                self.qweight = torch.zeros_like(weights, dtype = torch.short)
+            done = False
+            while not done:
 
-            # Quantize groups
+                try:
 
-            num_groups = 0
-            for bits_idx in range(len(self.bits)):
-                num_groups += self.bits_groups[bits_idx]
+                    hessian_inv_cuda = self.hessian_inv.to(torch.device(current_device))
 
-            scale = []
-            qscale = []
-            qscale_max = torch.empty((num_groups,), dtype = torch.float, device = self.weights.device)
-            qgroups = []
+                    # if apply:
+                    #     weights = self.weights
+                    #     self.layer.weight.data = torch.zeros((1, 1), dtype = torch.float32, device = weights.device)
+                    # else:
+                    #     weights = self.weights.clone()
+                    weights = weights_cpu.to(torch.device(current_device))
 
-            error = weights.clone()
-            group_idx = 0
-            group_idx_list = []
+                    self.quant = torch.zeros_like(weights_cpu, device = torch.device(current_device))
 
-            b = 0
-            for bits_idx, bits in enumerate(self.bits):
-                quantizer = AdaptiveQuantizer(bits = bits, scale_bits = self.scale_bits)
+                    if keep_qweight:
+                        self.qweight = torch.zeros_like(weights, dtype = torch.short)
 
-                for group in range(self.bits_groups[bits_idx]):
-                    a = b
-                    b = min(a + self.group_size[bits], self.rows)
+                    # Quantize groups
 
-                    qgroups.append(bits)
-                    qgroups.append(0)
+                    num_groups = 0
+                    for bits_idx in range(len(self.bits)):
+                        num_groups += self.bits_groups[bits_idx]
 
-                    quantizer.find_params(weights[a : b, :])
-                    scale.append(quantizer.scale)
-                    qscale.append(quantizer.qscale)
-                    qscale_max[group_idx] = quantizer.qscale_max
+                    scale = []
+                    qscale = []
+                    qscale_max = torch.empty((num_groups,), dtype = torch.float, device = torch.device(current_device))
+                    qgroups = []
 
-                    ext_c.quantize_range(self.quant,
-                                         quantizer.scale,
-                                         self.qweight if keep_qweight else none_tensor,
-                                         quantizer.qzero,
-                                         quantizer.maxq,
-                                         self.hessian_inv,
-                                         weights,
-                                         error,
-                                         a,
-                                         b)
+                    error = weights.clone()
+                    group_idx = 0
+                    group_idx_list = []
 
-                    group_idx_list += [group_idx] * (b - a)
-                    group_idx += 1
+                    b = 0
+                    for bits_idx, bits in enumerate(self.bits):
+                        quantizer = AdaptiveQuantizer(bits = bits, scale_bits = self.scale_bits)
 
+                        for group in range(self.bits_groups[bits_idx]):
+                            a = b
+                            b = min(a + self.group_size[bits], self.rows)
+
+                            qgroups.append(bits)
+                            qgroups.append(0)
+
+                            quantizer.find_params(weights[a : b, :])
+                            scale.append(quantizer.scale)
+                            qscale.append(quantizer.qscale)
+                            qscale_max[group_idx] = quantizer.qscale_max
+
+                            ext_c.quantize_range(self.quant,
+                                                 quantizer.scale,
+                                                 self.qweight if keep_qweight else none_tensor,
+                                                 quantizer.qzero,
+                                                 quantizer.maxq,
+                                                 hessian_inv_cuda,
+                                                 weights,
+                                                 error,
+                                                 a,
+                                                 b)
+
+                            group_idx_list += [group_idx] * (b - a)
+                            group_idx += 1
+
+                    done = True
+
+                except torch.cuda.OutOfMemoryError as e:
+                    current_device += 1
+                    print(f" !! Out of memory (Q), moving to device {current_device}")
+                    if current_device == max_devices:
+                        raise e
+                    self.quant_device = current_device
 
             # Create g_idx to store inverse activation order
 
             # self.g_idx = torch.tensor(group_idx_list, dtype = torch.int32, device = self.device)
             # self.g_idx = torch.tensor(group_idx_list, dtype = torch.int32)
 
-            self.invperm = torch.argsort(self.perm)
+            self.quant = self.quant.to("cuda:0")
+            self.invperm = torch.argsort(self.perm).to("cuda:0")
             # self.g_idx = self.g_idx[self.invperm]
 
             # Store scales
 
-            self.scale = torch.stack(scale, dim = 0)
-            self.qscale = torch.stack(qscale, dim = 0)
-            self.qscale_max = qscale_max.to(torch.float16)
-            self.qgroups = torch.tensor(qgroups, dtype = torch.short)
+            self.scale = torch.stack(scale, dim = 0).to("cuda:0")
+            self.qscale = torch.stack(qscale, dim = 0).to("cuda:0")
+            self.qscale_max = qscale_max.to(torch.float16).to("cuda:0")
+            self.qgroups = torch.tensor(qgroups, dtype = torch.short).to("cuda:0")
 
             # I love Python
 
@@ -441,7 +590,7 @@ class AdaptiveGPTQ:
         gc.collect()
         torch.cuda.empty_cache()
 
-        q = q.to(self.quant.device)
+        q = q.to(torch.device(self.quant_device))
         self.layer.weight.data = q
 
 
@@ -503,7 +652,7 @@ class AdaptiveGPTQ:
             qrows = math.ceil(qrows)
 
             g_qwt = qwt[row:row+rows, :].contiguous()
-            g_qwt_packed = torch.zeros((qrows, columns + padding), dtype = torch.int32, device = self.device)
+            g_qwt_packed = torch.zeros((qrows, columns + padding), dtype = torch.int32, device = g_qwt.device)
 
             if padding > 0: g_qwt[:, -padding:] = 2 ** (bits - 1)
 

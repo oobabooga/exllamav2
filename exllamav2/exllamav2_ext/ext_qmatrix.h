@@ -12,7 +12,8 @@ uintptr_t make_q_matrix
     torch::Tensor gptq_scales,
     torch::Tensor gptq_g_idx,
     torch::Tensor bias,
-    torch::Tensor temp_dq
+    torch::Tensor temp_dq,
+    int max_dq_rows
 );
 
 void free_q_matrix
@@ -32,6 +33,20 @@ void gemm_half_q_half
     uintptr_t b,
     torch::Tensor c,
     bool force_cuda
+);
+
+void matrix_q4_to_fp16
+(
+    torch::Tensor in,
+    torch::Tensor scales,
+    torch::Tensor out
+);
+
+void matrix_fp16_to_q4
+(
+    torch::Tensor in,
+    torch::Tensor out,
+    torch::Tensor scales
 );
 
 

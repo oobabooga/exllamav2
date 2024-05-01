@@ -8,6 +8,7 @@ from conversion.quantize import quant
 from conversion.optimize import optimize
 from conversion.compile import compile_model
 from conversion.qparams import qparams_headoptions
+import torch
 
 parser = argparse.ArgumentParser(description = "Convert model to ExLlamaV2")
 parser.add_argument("-i", "--in_dir", type = str, help = "Input directory", default = "")
@@ -28,6 +29,8 @@ parser.add_argument("-l", "--length", type = int, default = 2048, help = "Max no
 parser.add_argument("-ml", "--measurement_length", type = int, default = 2048, help = "Max no. tokens per sample when measuring")
 
 args = parser.parse_args()
+
+torch.set_printoptions(precision = 7, sci_mode = False, linewidth = 200)
 
 # Check some args
 
@@ -216,6 +219,12 @@ while True:
 
     if progress == "measure_quant":
         print(f" -- Measuring quantization impact...")
+
+        model.unload()
+        config.max_output_len = 16
+        model = ExLlamaV2(config)
+        model.load(lazy = True)
+
         status = measure_quant(job, save_job, model)  # capturing the graceful exits
         if status == "interrupted":
             print("Process interrupted. Exiting gracefully.")
@@ -226,6 +235,12 @@ while True:
         else:
             job["progress"] = "finished"
         save_job()
+
+        model.unload()
+        config.max_output_len = None
+        model = ExLlamaV2(config)
+        model.load(lazy = True)
+
 
     if progress == "optimize":
 

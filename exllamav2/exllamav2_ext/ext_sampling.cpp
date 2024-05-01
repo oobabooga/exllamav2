@@ -8,6 +8,13 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#ifdef __linux__
+#include <mm_malloc.h>
+#else
+#define _mm_malloc(a, b) _aligned_malloc(a, b)
+#define _mm_free(a) _aligned_free(a)
+#endif
+
 #include "config.h"
 #include "ext_sampling.h"
 
@@ -91,8 +98,8 @@ std::vector<float> sample_basic
     int vocab_size = logits.size(-1);
     int bsz = logits.size(0);
 
-    float* temp_probs = (float*) malloc(vocab_size * sizeof(float));
-    int* temp_indices = (int*) malloc(vocab_size * sizeof(int));
+    float* temp_probs = (float*) _mm_malloc(vocab_size * sizeof(float), 32);
+    int* temp_indices = (int*) _mm_malloc(vocab_size * sizeof(int), 32);
     float* logits_ptr = (float*) logits.data_ptr();
 
     int num_probs = 0;
@@ -240,8 +247,8 @@ std::vector<float> sample_basic
         }
     }
 
-    free(temp_probs);
-    free(temp_indices);
+    _mm_free(temp_probs);
+    _mm_free(temp_indices);
 
     return mirostat_mu;
 }
@@ -313,4 +320,9 @@ void fast_copy_cpu(torch::Tensor a, torch::Tensor b)
     size_t size_b = b.numel() * torch::elementSize(torch::typeMetaToScalarType(b.dtype()));
     TORCH_CHECK(size_a == size_b, "a and b are not the same size");
     memcpy(a.data_ptr(), b.data_ptr(), size_a);
+}
+
+void dump_profile_results()
+{
+    profile_results();
 }

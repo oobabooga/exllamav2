@@ -1,16 +1,23 @@
+from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from exllamav2.module import ExLlamaV2Module
 from exllamav2.rmsnorm import ExLlamaV2RMSNorm
 from exllamav2.layernorm import ExLlamaV2LayerNorm
 from exllamav2.linear import ExLlamaV2Linear
+from exllamav2.lora import ExLlamaV2Lora
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
-from exllamav2 import ext
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from exllamav2.model import ExLlamaV2
 
 class ExLlamaV2MoEMLP(ExLlamaV2Module):
 
+    name: str = "MoE MLP"
+
     layer_idx: int
-    post_attention_layernorm: ExLlamaV2RMSNorm or ExLlamaV2LayerNorm
+    post_attention_layernorm: ExLlamaV2RMSNorm | ExLlamaV2LayerNorm
     w1: list
     w2: list
     w3: list
@@ -18,36 +25,60 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
     num_experts: int
     num_experts_per_token: int
 
-    name: str = "MoE MLP"
-    submodules: list
+    q_handle: int | None
 
-    q_handle: int or None = None
+    temp_lora_size: int
 
-    temp_lora_size: int = 0
-
-    def __init__(self, model, key, layer_idx):
+    def __init__(self,
+                 model: ExLlamaV2,
+                 key: str,
+                 layer_idx: int):
         super().__init__(model, key)
+
+        cfg = self.model.config
 
         self.layer_idx = layer_idx
 
-        hidden_size = self.model.config.hidden_size
-        intermediate_size = self.model.config.intermediate_size
-        self.num_experts = self.model.config.num_experts
-        self.num_experts_per_token = self.model.config.num_experts_per_token
+        self.q_handle = None
+        self.temp_lora_size = 0
 
-        if self.model.config.arch.norm == "layernorm":
+        hidden_size = cfg.hidden_size
+        intermediate_size = cfg.intermediate_size
+        self.num_experts = cfg.num_experts
+        self.num_experts_per_token = cfg.num_experts_per_token
+
+        if cfg.arch.norm == "layernorm":
             self.post_attention_layernorm = ExLlamaV2LayerNorm(model, key + self.model.config.arch.norm_key_2)
-        elif self.model.config.arch.norm == "rmsnorm":
+        elif cfg.arch.norm == "rmsnorm":
             self.post_attention_layernorm = ExLlamaV2RMSNorm(model, key + self.model.config.arch.norm_key_2)
 
-        w1_key = self.model.config.arch.mlp_key_gate
-        w2_key = self.model.config.arch.mlp_key_down
-        w3_key = self.model.config.arch.mlp_key_up
-        gate_key = self.model.config.arch.mlp_key_expert_gate
+        w1_key = key + cfg.arch.mlp_key_gate
+        w2_key = key + cfg.arch.mlp_key_down
+        w3_key = key + cfg.arch.mlp_key_up
+        w1_f_key = w1_key.replace(".*.", ".")
+        w2_f_key = w2_key.replace(".*.", ".")
+        w3_f_key = w3_key.replace(".*.", ".")
 
-        self.w1 = [ExLlamaV2Linear(model, key + w1_key.replace("*", str(e)), hidden_size, intermediate_size, self.model.config.arch.mlp_bias) for e in range(self.num_experts)]
-        self.w2 = [ExLlamaV2Linear(model, key + w2_key.replace("*", str(e)), intermediate_size, hidden_size, self.model.config.arch.mlp_bias) for e in range(self.num_experts)]
-        self.w3 = [ExLlamaV2Linear(model, key + w3_key.replace("*", str(e)), hidden_size, intermediate_size, self.model.config.arch.mlp_bias) for e in range(self.num_experts)]
+        gate_key = cfg.arch.mlp_key_expert_gate
+
+        self.w1 = []
+        self.w2 = []
+        self.w3 = []
+
+        bu = 0
+        # bd = 0
+        for e in range(self.num_experts):
+            au = bu
+            # ad = bd
+            bu += intermediate_size
+            # bd += hidden_size
+            w1 = ExLlamaV2Linear(model, w1_key.replace("*", str(e)), hidden_size, intermediate_size, cfg.arch.mlp_bias, f_key = w1_f_key, f_beg = au, f_end = bu)
+            w2 = ExLlamaV2Linear(model, w2_key.replace("*", str(e)), intermediate_size, hidden_size, cfg.arch.mlp_bias, f_key = w2_f_key, f_beg = au, f_end = bu)
+            w3 = ExLlamaV2Linear(model, w3_key.replace("*", str(e)), hidden_size, intermediate_size, cfg.arch.mlp_bias, f_key = w3_f_key, f_beg = au, f_end = bu)
+            self.w1.append(w1)
+            self.w2.append(w2)
+            self.w3.append(w3)
+
         self.gate = ExLlamaV2Linear(model, key + gate_key, hidden_size, self.num_experts, False, pad32 = False)
 
         self.submodules = [self.post_attention_layernorm,
@@ -56,7 +87,8 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
                            self.w2 + \
                            self.w3
 
-    def numel(self):
+
+    def numel(self) -> int:
 
         return sum(l.numel() for l in self.w1 + self.w2 + self.w3)
 
@@ -74,7 +106,7 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
             device_tensors = self.model.get_device_tensors(self.device_idx)
             device_tensors.begin_scratch_alloc()
             self.q_handle = ext_c.make_q_moe_mlp(self.post_attention_layernorm.weight,
-                                                 self.post_attention_layernorm.bias if self.post_attention_layernorm.bias is not None else ext.none_tensor,
+                                                 self.post_attention_layernorm.bias if self.post_attention_layernorm.bias is not None else none_tensor,
                                                  isinstance(self.post_attention_layernorm, ExLlamaV2RMSNorm),
                                                  self.post_attention_layernorm.variance_epsilon,
                                                  self.gate.linear.weight,
@@ -94,9 +126,9 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
 
 
     def unload(self):
-        # if self.q_handle is not None:
-        #     ext_c.free_q_mlp(self.q_handle)
-        #     self.q_handle = None
+        if self.q_handle is not None:
+            ext_c.free_q_moe_mlp(self.q_handle)
+            self.q_handle = None
 
         self.post_attention_layernorm.unload()
         self.gate.unload()
@@ -106,7 +138,7 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
             self.w3[e].unload()
 
 
-    def weight_footprint(self):
+    def weight_footprint(self) -> int:
 
         return self.post_attention_layernorm.weight_footprint() + \
                self.gate.weight_footprint() + \
@@ -115,7 +147,7 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
                sum(self.w3[e].weight_footprint() for e in range(self.num_experts))
 
 
-    def scratch_space_fixed(self):
+    def scratch_space_fixed(self) -> int:
 
         return self.temp_state_size() + \
                self.temp_gathered_state_size() + \
@@ -125,7 +157,7 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
                self.temp_dq_size()
 
 
-    def scratch_space(self):
+    def scratch_space(self) -> int:
 
         assert self.model.config.intermediate_size >= self.model.config.hidden_size
         return self.temp_state_size() + \
@@ -136,39 +168,39 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
                self.temp_dq_size()
 
 
-    def temp_state_size(self):
+    def temp_state_size(self) -> int:
 
         return self.model.config.max_input_len * self.model.config.max_batch_size * self.model.config.hidden_size * 2 + 128
 
 
-    def temp_gathered_state_size(self):
+    def temp_gathered_state_size(self) -> int:
 
         return self.model.config.max_input_len * self.model.config.max_batch_size * self.model.config.hidden_size * 2 + 128
 
 
-    def temp_a_size(self):
+    def temp_a_size(self) -> int:
 
         return self.model.config.max_input_len * self.model.config.max_batch_size * self.model.config.intermediate_size * 2 + 128
 
 
-    def temp_b_size(self):
+    def temp_b_size(self) -> int:
 
         return self.model.config.max_input_len * self.model.config.max_batch_size * self.model.config.intermediate_size * 2 + 128
 
 
-    def temp_dq_size(self):
+    def temp_dq_size(self) -> int:
 
         return max(self.w1[0].temp_dq_size(),
                    self.w2[0].temp_dq_size(),
                    self.w3[0].temp_dq_size())
 
 
-    def temp_logit_size(self):
+    def temp_logit_size(self) -> int:
 
         return self.model.config.max_input_len * self.model.config.max_batch_size * self.model.config.num_experts * 2 + 128
 
 
-    def set_device_idx(self, idx):
+    def set_device_idx(self, idx: int):
         super().set_device_idx(idx)
 
         self.post_attention_layernorm.set_device_idx(idx)
@@ -179,19 +211,26 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
             self.w3[e].set_device_idx(idx)
 
 
-    def forward(self, hidden_states, cache = None, attn_params = None, past_len = None, intermediates = False, loras = None, position_offsets = None):
+    def forward(self,
+                hidden_states: torch.Tensor,
+                cache = None,
+                attn_params = None,
+                past_len = None,
+                intermediates: bool = False,
+                loras: list[ExLlamaV2Lora] | None = None,
+                **kwargs) -> torch.Tensor | dict[str: torch.Tensor]:
 
         batch_size, sequence_length, hidden_dim = hidden_states.shape
 
         # TODO: LoRA currently uses the Torch codepath. Needs conditional (early-exit) kernels with output scaling
         # for the LoRA matmuls in order to work with the C++ path
 
-        if self.q_handle is None or intermediates or batch_size * sequence_length > 4 or self.num_experts not in [4, 8] or (loras is not None and len(loras) > 0):
-            return self.forward_torch(hidden_states, cache, attn_params, intermediates, loras = loras)
+        if self.q_handle is None or intermediates or batch_size * sequence_length > 4 or self.num_experts not in [4, 8, 16] or (loras is not None and len(loras) > 0):
+            return self.forward_torch(hidden_states, cache, attn_params, past_len, intermediates, loras = loras, **kwargs)
 
         # if loras is None or self.temp_lora_size == 0:
         #     pass_loras = []
-        #     pass_lora_temp = ext.none_tensor
+        #     pass_lora_temp = none_tensor
         # else:
         #     pass_loras = [id(x) for x in loras]
         #     pass_lora_temp = torch.empty((self.temp_lora_size,), dtype = torch.half, device = hidden_states.device)
@@ -203,7 +242,14 @@ class ExLlamaV2MoEMLP(ExLlamaV2Module):
         return hidden_states
 
 
-    def forward_torch(self, hidden_states, cache = None, attn_params = None, intermediates = False, loras = None, position_offsets = None):
+    def forward_torch(self,
+                      hidden_states: torch.Tensor,
+                      cache = None,
+                      attn_params = None,
+                      past_len = None,
+                      intermediates = False,
+                      loras: list[ExLlamaV2Lora] | None = None,
+                      **kwargs) -> torch.Tensor | dict[str: torch.Tensor]:
 
         residual = hidden_states
 

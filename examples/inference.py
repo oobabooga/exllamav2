@@ -19,17 +19,12 @@ import time
 # Initialize model and cache
 
 model_directory =  "/mnt/str/models/mistral-7b-instruct-exl2/4.0bpw/"
-
-config = ExLlamaV2Config()
-config.model_dir = model_directory
-config.prepare()
-
-model = ExLlamaV2(config)
 print("Loading model: " + model_directory)
 
+config = ExLlamaV2Config(model_directory)
+model = ExLlamaV2(config)
 cache = ExLlamaV2Cache(model, lazy = True)
 model.load_autosplit(cache)
-
 tokenizer = ExLlamaV2Tokenizer(config)
 
 # Initialize generator
@@ -42,7 +37,7 @@ settings = ExLlamaV2Sampler.Settings()
 settings.temperature = 0.85
 settings.top_k = 50
 settings.top_p = 0.8
-settings.token_repetition_penalty = 1.05
+settings.token_repetition_penalty = 1.01
 settings.disallow_tokens(tokenizer, [tokenizer.eos_token_id])
 
 prompt = "Our story begins in the Scottish town of Auchtermuchty, where once"

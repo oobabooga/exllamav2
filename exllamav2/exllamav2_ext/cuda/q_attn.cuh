@@ -18,6 +18,9 @@ public:
     bool layernorm_is_rms;
     float norm_epsilon;
 
+    half* q_norm;
+    half* k_norm;
+
     QMatrix* q_proj;
     QMatrix* k_proj;
     QMatrix* v_proj;
@@ -42,6 +45,9 @@ public:
     std::unordered_map<uintptr_t, std::tuple<half*, half*, int>> v_proj_lora;
     std::unordered_map<uintptr_t, std::tuple<half*, half*, int>> o_proj_lora;
 
+    bool has_residual;
+    bool neox_style;
+
     QAttn
     (
         half* _layernorm,
@@ -62,7 +68,11 @@ public:
         int _num_heads,
         int _num_kv_heads,
         int _head_dim,
-        int _max_seq_len
+        int _max_seq_len,
+        bool _has_residual,
+        bool _neox_style,
+        half* _q_norm,
+        half* _k_norm
     );
 
     ~QAttn();

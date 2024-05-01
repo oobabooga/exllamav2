@@ -35,7 +35,11 @@ uintptr_t make_q_attn
     int num_heads,
     int num_kv_heads,
     int head_dim,
-    int max_seq_len
+    int max_seq_len,
+    bool has_residual,
+    bool neox_style,
+    torch::Tensor q_norm,
+    torch::Tensor k_norm
 )
 {
     QMatrix* qm_q_proj = reinterpret_cast<QMatrix*> (q_q_proj);
@@ -70,7 +74,11 @@ uintptr_t make_q_attn
         num_heads,
         num_kv_heads,
         head_dim,
-        max_seq_len
+        max_seq_len,
+        has_residual,
+        neox_style,
+        (half*) q_norm.is_meta() ? NULL : (half*) q_norm.data_ptr(),
+        (half*) k_norm.is_meta() ? NULL : (half*) k_norm.data_ptr()
     );
 
     return reinterpret_cast<uintptr_t> (attn);
