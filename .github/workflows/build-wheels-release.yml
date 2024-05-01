@@ -19,7 +19,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-20.04, windows-latest]
         pyver: ["3.10", "3.11"]
         cuda: ["11.8.0", "12.1.1"]
     defaults:
@@ -125,7 +125,7 @@ jobs:
   #   name: Publish Python distribution to PyPI
   #   if: inputs.pypi == '1'
   #   needs: ['build_wheels','build_rocm']
-  #   runs-on: ubuntu-latest
+  #   runs-on: ubuntu-20.04
   #   
   #   environment:
   #     name: pypi
@@ -196,7 +196,7 @@ jobs:
     name: Publish Python distribution to PyPI
     if: inputs.pypi == '1'
     needs: build_sdist
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
     
     environment:
       name: pypi
