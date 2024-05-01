@@ -9,12 +9,11 @@ permissions:
 
 jobs:
   build_wheels:
-    name: Build ROCm ${{ matrix.rocm }} wheel for Python ${{ matrix.pyver }}
+    name: Build ROCm 5.6 wheel for Python ${{ matrix.pyver }}
     runs-on: ubuntu-20.04
     strategy:
       matrix:
         pyver: ["3.10", "3.11"]
-        rocm: ["5.6", "6.0"]
 
     steps:
       - name: Free Disk Space
@@ -31,7 +30,7 @@ jobs:
 
       - name: Install ROCm SDK
         run: |
-          export ROCM_VERSION=${{ matrix.rocm }}
+          export ROCM_VERSION=5.6
           echo "ROCM_VERSION set to $ROCM_VERSION"
           
           [ ! -d /etc/apt/keyrings ] && sudo mkdir --parents --mode=0755 /etc/apt/keyrings
