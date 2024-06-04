@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from exllamav2.config import ExLlamaV2Config
 from exllamav2.fasttensors import STFile
+from exllamav2.compat import safe_move_tensor
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -123,10 +124,14 @@ class ExLlamaV2Module:
                     tensors = self.load_multi(key, ["weight", "bias"])
                     tensor = tensors["weight"].half()
                     bias = tensors["bias"].half()
+                    if self.model.config.arch.orig_weights_transposed and len(tensor.shape) == 2:
+                        tensor = tensor.T
                     return nn.Parameter(tensor), nn.Parameter(bias)
                 else:
                     tensors = self.load_multi(key, ["weight"])
                     tensor = tensors["weight"].half()
+                    # if self.model.config.arch.orig_weights_transposed:
+                    #     tensor = tensor.T
                     return nn.Parameter(tensor)
 
             # No weights found for key
@@ -141,7 +146,8 @@ class ExLlamaV2Module:
                           in_feat: int,
                           out_feat: int):
 
-        for key in [f_key, f_key + ".weight"]:
+        res = []
+        for key in [f_key, f_key + ".weight", f_key + ".bias"]:
 
             filename = self.model.config.tensor_file_map.get(key)
             if not filename: continue
@@ -149,14 +155,19 @@ class ExLlamaV2Module:
             stfile = STFile.open(filename, fast = self.model.config.fasttensors, keymap = self.model.config.arch.keymap)
             # tensor = stfile.get_tensor(key, device = self.device()).half()
             tensor = stfile.get_tensor(key, device = "cpu", cached = True, out_dtype = torch.half)
-            tensor = tensor[f_beg:f_end, :]
-            if in_feat != out_feat and \
-                tensor.shape[1] == out_feat and \
-                tensor.shape[0] == in_feat:
+            if self.model.config.arch.orig_weights_transposed and len(tensor.shape) == 2:
                 tensor = tensor.T
+            tensor = tensor[f_beg:f_end]
+            if not key.endswith(".bias"):
+                if in_feat != out_feat and \
+                    tensor.shape[1] == out_feat and \
+                    tensor.shape[0] == in_feat:
+                    tensor = tensor.T
             tensor = tensor.contiguous().to(self.device())
-            return nn.Parameter(tensor)
+            res.append(nn.Parameter(tensor))
 
+        if len(res) == 2: return res[0], res[1]
+        if len(res) == 1: return res[0]
         return None
 
 
@@ -207,3 +218,45 @@ class ExLlamaV2Module:
     def reload(self):
         self.unload()
         self.load()
+
+
+class Intervention(ExLlamaV2Module):
+
+    inner: ExLlamaV2Module
+
+    def __init__(self, inner: ExLlamaV2Module, pre_forward = None, post_forward = None):
+        super().__init__(inner.model, inner.key)
+
+        self.inner = inner
+        self.pre_forward = pre_forward
+        self.post_forward = post_forward
+
+        self.device_idx = self.inner.device_idx
+        if hasattr(self.inner, "padding"): self.padding = self.inner.padding
+
+    def numel(self): return self.inner.numel()
+    def load(self): return self.inner.load()
+    def unload(self): return self.inner.unload()
+    def scratch_space_fixed(self): return self.inner.scratch_space_fixed()
+    def scratch_space(self): return self.inner.scratch_space()
+    def device(self): return self.inner.device()
+    def set_device_idx(self, idx: int): raise NotImplementedError()
+    def weight_footprint(self): return self.inner.weight_footprint()
+    def reload(self): return self.inner.reload()
+    def is_quant(self): return self.inner.is_quant()
+
+    def forward(self, hidden_states, *args, **kwargs):
+
+        if self.pre_forward:
+            dev = hidden_states.device
+            hidden_states = self.pre_forward(hidden_states, *args, **kwargs)
+            hidden_states = safe_move_tensor(hidden_states, dev)
+
+        hidden_states = self.inner.forward(hidden_states, *args, **kwargs)
+
+        if self.post_forward:
+            dev = hidden_states.device
+            hidden_states = self.post_forward(hidden_states, *args, **kwargs)
+            hidden_states = safe_move_tensor(hidden_states, dev)
+
+        return hidden_states

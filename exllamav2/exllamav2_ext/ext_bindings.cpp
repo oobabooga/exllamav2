@@ -41,14 +41,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("fast_fadd_cpu", &fast_fadd_cpu, "fast_fadd_cpu");
     m.def("fast_copy_cpu", &fast_copy_cpu, "fast_copy_cpu");
     m.def("dump_profile_results", &dump_profile_results, "dump_profile_results");
+    m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
 
     // safetensors
 
     m.def("safetensors_open", &safetensors_open, "safetensors_open");
+    m.def("safetensors_open_fb", &safetensors_open_fb, "safetensors_open_fb");
     m.def("safetensors_close", &safetensors_close, "safetensors_close");
+    m.def("safetensors_close_fb", &safetensors_close_fb, "safetensors_close_fb");
     m.def("safetensors_load", &safetensors_load, "safetensors_load");
     m.def("safetensors_pinned_buffer", &safetensors_pinned_buffer, "safetensors_pinned_buffer");
     m.def("safetensors_free_pinned_buffer", &safetensors_free_pinned_buffer, "safetensors_free_pinned_buffer");
+    m.def("safetensors_read_fb", &safetensors_read_fb, "safetensors_read_fb");
 
     // qmatrix
 
@@ -84,6 +88,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("fp8_to_fp16", &fp8_to_fp16, "fp8_to_fp16");
     m.def("fp16_to_q4_kv", &fp16_to_q4_kv, "fp16_to_q4_kv");
     m.def("q4_to_fp16_kv", &q4_to_fp16_kv, "q4_to_fp16_kv");
+    m.def("count_match", &count_match, "count_match");
 //    m.def("array_fp16_to_fp8_ref", &array_fp16_to_fp8_ref, "array_fp16_to_fp8_ref");
 //    m.def("array_fp8_to_fp16_ref", &array_fp8_to_fp16_ref, "array_fp8_to_fp16_ref");
 

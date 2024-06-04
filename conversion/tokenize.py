@@ -3,6 +3,7 @@ import pandas, fastparquet
 import os
 from safetensors.torch import save_file
 import random
+from conversion.bot_status import print_stage
 
 def get_tokens(num_rows, length, filename, tokenizer):
 
@@ -37,6 +38,8 @@ def get_tokens(num_rows, length, filename, tokenizer):
 
 def tokenize(job, save_fn, tokenizer, measure = False):
 
+    print_stage(job, "Tokenizing (1)" if measure else "Tokenizing (2)", 0, 1)
+
     cal_ds = job["cal_dataset"]
 
     if cal_ds is not None:
@@ -44,15 +47,17 @@ def tokenize(job, save_fn, tokenizer, measure = False):
         length = job["measurement_length"] if measure else job["length"]
         cal_tokens = get_tokens(rows, length, cal_ds, tokenizer)
     else:
-        cal_tokens = get_standard_calibration(measure, tokenizer)
+        cal_tokens = get_standard_calibration(job, measure, tokenizer)
 
     cal_filename = os.path.join(job["out_dir"], "cal_data.safetensors")
     cal_dict = { "input_ids": cal_tokens }
     save_file(cal_dict, cal_filename)
     job["cal_filename"] = cal_filename
 
+    print_stage(job, "Tokenizing (1)" if measure else "Tokenizing (2)", 1, 1)
 
-def get_standard_calibration(measure, tokenizer):
+
+def get_standard_calibration(job, measure, tokenizer):
 
     data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "standard_cal_data")
     file_c4 =os.path.join(data_dir, "c4.utf8")
@@ -72,6 +77,8 @@ def get_standard_calibration(measure, tokenizer):
     rows_technical = 2 if measure else 10
     rows_random = 2
 
+    ctx = min(2048, job["measurement_length"] if measure else job["length"])
+
     # C4: 10 rows
 
     with open(file_c4, "r", encoding="utf8") as f:
@@ -79,8 +86,8 @@ def get_standard_calibration(measure, tokenizer):
 
     text = "\n\n".join(lines)
     tokens = tokenizer.encode(text)
-    tokens = tokens[:, : tokens.shape[-1] - (tokens.shape[-1] % 2048)]
-    tokenized_rows = tokens.view(-1, 2048)
+    tokens = tokens[:, : tokens.shape[-1] - (tokens.shape[-1] % ctx)]
+    tokenized_rows = tokens.view(-1, ctx)
 
     for i in range(rows_c4):
         rows.append(tokenized_rows[i:i+1])
@@ -97,12 +104,12 @@ def get_standard_calibration(measure, tokenizer):
     for r in range(rows_wiki):
         length = 0
         idx0 = idx
-        while length < 2049:
+        while length < ctx + 1:
             length += tokenized_articles[idx].shape[-1]
             idx += 1
         row = torch.cat(tokenized_articles[idx0 : idx], dim = -1)
-        if r < rows_wiki // 2: row = row[:, 1:2049]
-        else: row = row[:, :2048]
+        if r < rows_wiki // 2: row = row[:, 1:ctx+1]
+        else: row = row[:, :ctx]
         rows.append(row)
 
     # Code: 15 rows
@@ -111,8 +118,8 @@ def get_standard_calibration(measure, tokenizer):
         text = f.read()
 
     tokens = tokenizer.encode(text)
-    tokens = tokens[:, : tokens.shape[-1] - (tokens.shape[-1] % 2048)]
-    tokenized_rows = tokens.view(-1, 2048)
+    tokens = tokens[:, : tokens.shape[-1] - (tokens.shape[-1] % ctx)]
+    tokenized_rows = tokens.view(-1, ctx)
 
     for i in range(rows_code):
         rows.append(tokenized_rows[i:i+1])
@@ -129,12 +136,12 @@ def get_standard_calibration(measure, tokenizer):
     for r in range(rows_tiny):
         length = 0
         idx0 = idx
-        while length < 2049:
+        while length < ctx + 1:
             length += tokenized_articles[idx].shape[-1]
             idx += 1
         row = torch.cat(tokenized_articles[idx0 : idx], dim = -1)
-        if r < rows_tiny // 2: row = row[:, 1:2049]
-        else: row = row[:, :2048]
+        if r < rows_tiny // 2: row = row[:, 1:ctx+1]
+        else: row = row[:, :ctx]
         rows.append(row)
 
     # Multilingual: 15 rows + 5 shuffled rows
@@ -143,8 +150,8 @@ def get_standard_calibration(measure, tokenizer):
         text = f.read()
 
     tokens = tokenizer.encode(text)
-    tokens = tokens[:, : tokens.shape[-1] - (tokens.shape[-1] % 2048)]
-    tokenized_rows = tokens.view(-1, 2048)
+    tokens = tokens[:, : tokens.shape[-1] - (tokens.shape[-1] % ctx)]
+    tokenized_rows = tokens.view(-1, ctx)
 
     for i in range(rows_multilingual):
         rows.append(tokenized_rows[i:i+1])
@@ -153,7 +160,7 @@ def get_standard_calibration(measure, tokenizer):
     random.seed(69420)
     for i in range(rows_multilingual_s):
         row = []
-        for j in range(2048 // 128):
+        for j in range(ctx // 128):
             k = random.randint(0, tokenized_rows.shape[0] - 1)
             row.append(tokenized_rows[k].unsqueeze(0))
         rows.append(torch.cat(row, dim = -1))
@@ -163,7 +170,7 @@ def get_standard_calibration(measure, tokenizer):
     vocab_size = tokenizer.get_vocab_size()
     random.seed(69420)
     for i in range(rows_random):
-        row = torch.randint(0, vocab_size, (1, 2048), dtype = torch.long)
+        row = torch.randint(0, vocab_size, (1, ctx), dtype = torch.long)
         rows.append(row)
 
     # Technical: 10 rows
@@ -172,8 +179,8 @@ def get_standard_calibration(measure, tokenizer):
         text = f.read()
 
     tokens = tokenizer.encode(text)
-    tokens = tokens[:, : tokens.shape[-1] - (tokens.shape[-1] % 2048)]
-    tokenized_rows = tokens.view(-1, 2048)
+    tokens = tokens[:, : tokens.shape[-1] - (tokens.shape[-1] % ctx)]
+    tokenized_rows = tokens.view(-1, ctx)
 
     for i in range(rows_technical):
         rows.append(tokenized_rows[i:i+1])

@@ -106,7 +106,6 @@ class ExLlamaV2Tokenizer:
         else: raise FileNotFoundError("No supported tokenizer found.")
 
         # Attempt to load added tokens from tokenizer.json
-        # TODO: Deal with rstrip and lstrip for added, non-control tokens
 
         self.extended_piece_to_id = {}
         self.unspecial_piece_to_id = {}
@@ -196,7 +195,12 @@ class ExLlamaV2Tokenizer:
 
         if self.pad_token_id is None:
             pad_test = self.tokenizer_model.piece_to_id("<pad>")
-            self.pad_token_id = pad_test or self.bos_token_id
+            if pad_test:
+                self.pad_token_id = pad_test
+            elif self.eos_token_id != self.bos_token_id:
+                self.pad_token_id = self.eos_token_id
+            else:
+                self.pad_token_id = -1
 
         # Special case if <unk> and <pad> have the same ID
 
@@ -248,6 +252,12 @@ class ExLlamaV2Tokenizer:
             self.get_prefix_id_to_ids_dict()
             self.get_char_trie()
             self.get_char_trie_ci()
+
+        # Take stock and issue warnings if needed
+
+        if self.pad_token_id == self.bos_token_id:
+            print(" !! Warning: PAD and EOS tokens are identical. Generations might break " + \
+                  "and batch sizes > 1 are unlikely to work correctly.")
 
 
     # Return size of valid vocabulary
@@ -336,7 +346,6 @@ class ExLlamaV2Tokenizer:
 
 
     # Encode string or list of strings
-    # TODO: Deal with rstrip and lstrip for control tokens
 
     def encode(self,
                text: str | list[str],
@@ -447,6 +456,8 @@ class ExLlamaV2Tokenizer:
 
         else:
 
+            max_token = self.tokenizer_model.vocab_size()
+            seq = [t for t in seq if (t != self.pad_token_id and t < max_token)]
             text = ""
             start = 0
             end = 0

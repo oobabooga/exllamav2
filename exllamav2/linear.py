@@ -39,6 +39,8 @@ class ExLlamaV2Linear(ExLlamaV2Module):
     f_beg: int | None
     f_end: int | None
 
+    is_sub_module: bool
+
     def __init__(self,
                  model: ExLlamaV2,
                  key: str,
@@ -50,8 +52,11 @@ class ExLlamaV2Linear(ExLlamaV2Module):
                  prescale: float = 1,
                  f_key: str = None,
                  f_beg: int = None,
-                 f_end: int = None):
+                 f_end: int = None,
+                 is_sub_module: bool = True):
         super().__init__(model, key)
+
+        self.is_sub_module = is_sub_module
 
         if pad32:
             self.padding = -out_features % 32
@@ -84,6 +89,7 @@ class ExLlamaV2Linear(ExLlamaV2Module):
         self.assumed_footprint = in_features * (out_features + self.padding) * 2 + 128
 
 
+    @torch.inference_mode
     def load(self,
              w: dict | nn.Parameter | tuple | None = None,
              device_tensors: bool = True):
@@ -196,13 +202,13 @@ class ExLlamaV2Linear(ExLlamaV2Module):
     def scratch_space_fixed(self) -> int:
 
         return self.temp_dq_size() + \
-               self.temp_fwd_size()
+               (self.temp_fwd_size() if self.is_sub_module else 0)
 
 
     def scratch_space(self) -> int:
 
         return self.temp_dq_size() + \
-               self.temp_fwd_size()
+               (self.temp_fwd_size() if self.is_sub_module else 0)
 
 
     def temp_dq_size(self) -> int:

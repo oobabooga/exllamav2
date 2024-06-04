@@ -10,3 +10,4 @@ websockets
 regex
 numpy
 tokenizers
+rich

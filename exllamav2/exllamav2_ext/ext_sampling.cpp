@@ -18,9 +18,11 @@
 #include "config.h"
 #include "ext_sampling.h"
 
+#include "cpp/generator.h"
 #include "cpp/sampling.h"
 
 #include "cpp/util.h"
+#include "Python.h"
 
 void apply_rep_penalty
 (
@@ -41,6 +43,8 @@ void apply_rep_penalty
     int bsz = sequence.size(0);
     int seq_len = sequence.size(-1);
 
+    Py_BEGIN_ALLOW_THREADS
+
     for (int i = 0; i < bsz; i++)
     {
         apply_rep_penalty_cpu
@@ -56,6 +60,8 @@ void apply_rep_penalty
             ((float*) logits.data_ptr()) + i * vocab_size
         );
     }
+
+    Py_END_ALLOW_THREADS
 }
 
 std::vector<float> sample_basic
@@ -107,6 +113,8 @@ std::vector<float> sample_basic
         num_probs = output_kprobs.size(2);
 
     bool* logits_filter_ptr = (bool*) logit_filter.data_ptr();
+
+    Py_BEGIN_ALLOW_THREADS
 
     if (temperature < 0.01)
     {
@@ -250,6 +258,7 @@ std::vector<float> sample_basic
     _mm_free(temp_probs);
     _mm_free(temp_indices);
 
+    Py_END_ALLOW_THREADS
     return mirostat_mu;
 }
 
@@ -264,6 +273,8 @@ void logit_filter_exclusive
 
     bool* filter_ptr = (bool*) filter.data_ptr();
     unsigned int vocab_size = filter.size(1);
+
+    Py_BEGIN_ALLOW_THREADS
 
     for(const auto& list : exclusive_lists)
     {
@@ -286,6 +297,8 @@ void logit_filter_exclusive
 
         filter_ptr += vocab_size;
     }
+
+    Py_END_ALLOW_THREADS
 }
 
 void fast_fill_cpu_ones_bool(torch::Tensor tensor)
@@ -306,21 +319,72 @@ void fast_fadd_cpu(torch::Tensor a, torch::Tensor b)
     float* a_ptr = (float*) a.data_ptr();
     float* b_ptr = (float*) b.data_ptr();
 
+    Py_BEGIN_ALLOW_THREADS
+
     for (int i = 0; i < bsz; ++i)
     {
         float* b_ptr_ = b_ptr;
         for (int j = 0; j < m; ++j)
             *a_ptr++ += *b_ptr_++;
     }
+
+    Py_END_ALLOW_THREADS
 }
 
-void fast_copy_cpu(torch::Tensor a, torch::Tensor b)
+void fast_copy_cpu(torch::Tensor dst, torch::Tensor src)
 {
-    size_t size_a = a.numel() * torch::elementSize(torch::typeMetaToScalarType(a.dtype()));
-    size_t size_b = b.numel() * torch::elementSize(torch::typeMetaToScalarType(b.dtype()));
-    TORCH_CHECK(size_a == size_b, "a and b are not the same size");
-    memcpy(a.data_ptr(), b.data_ptr(), size_a);
+    TORCH_CHECK(dst.sizes() == src.sizes(), "Tensors must have the same shape");
+    TORCH_CHECK(dst.dtype() == src.dtype(), "Tensors must have the same dtype");
+
+    auto dst_strides = dst.strides();
+    auto src_strides = src.strides();
+    auto sizes = dst.sizes();
+
+    Py_BEGIN_ALLOW_THREADS
+
+    if (dst.is_contiguous() && src.is_contiguous())
+    {
+        std::memcpy(dst.data_ptr(), src.data_ptr(), src.numel() * src.element_size());
+    }
+    else
+    {
+        auto copy_recursive = [&](auto& self, int64_t dst_offset, int64_t src_offset, int dim) -> void
+        {
+            if (dim == sizes.size())
+            {
+                std::memcpy(static_cast<char*>(dst.data_ptr()) + dst_offset * dst.element_size(),
+                            static_cast<char*>(src.data_ptr()) + src_offset * src.element_size(),
+                            dst.element_size());
+                return;
+            }
+
+            for (int64_t i = 0; i < sizes[dim]; ++i)
+            {
+                self(self, dst_offset + i * dst_strides[dim],
+                     src_offset + i * src_strides[dim],
+                     dim + 1);
+            }
+        };
+
+        copy_recursive(copy_recursive, 0, 0, 0);
+    }
+
+    Py_END_ALLOW_THREADS
 }
+
+
+//void fast_copy_cpu(torch::Tensor a, torch::Tensor b)
+//{
+//    size_t size_a = a.numel() * torch::elementSize(torch::typeMetaToScalarType(a.dtype()));
+//    size_t size_b = b.numel() * torch::elementSize(torch::typeMetaToScalarType(b.dtype()));
+//    TORCH_CHECK(size_a == size_b, "a and b are not the same size");
+//
+//    Py_BEGIN_ALLOW_THREADS
+//
+//    memcpy(a.data_ptr(), b.data_ptr(), size_a);
+//
+//    Py_END_ALLOW_THREADS
+//}
 
 void dump_profile_results()
 {

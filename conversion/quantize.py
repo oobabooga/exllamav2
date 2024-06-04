@@ -1,6 +1,7 @@
 from exllamav2.model import \
 (
     ExLlamaV2Embedding,
+    ExLlamaV2PosEmbedding,
     ExLlamaV2Attention,
     ExLlamaV2MLP,
     ExLlamaV2MoEMLP,
@@ -19,6 +20,7 @@ from torch import nn
 import os, time, math, json
 import torch.nn.functional as F
 import gc
+from conversion.bot_status import print_stage
 
 def list_live_tensors():
 
@@ -274,6 +276,8 @@ def quant(job, save_fn, model):
     index = job["q_last_module_idx"]
     while True:
 
+        print_stage(job, "Quantizing", index, len(model.modules))
+
         index += 1
         if index >= len(model.modules): break
 
@@ -326,6 +330,9 @@ def quant(job, save_fn, model):
 
         elif isinstance(module, ExLlamaV2RMSNorm) or isinstance(module, ExLlamaV2LayerNorm):
             mode = "norm"
+
+        elif isinstance(module, ExLlamaV2PosEmbedding):
+            mode = "pos_emb"
 
         elif isinstance(module, ExLlamaV2ParallelDecoder):
             mode = "parallel_decoder"
@@ -432,7 +439,7 @@ def quant(job, save_fn, model):
                 cal_ids = f.get_tensor("input_ids")
             module.linear.weight.data = module.linear.weight.data.to("cuda:0")
 
-        rfn_sum = 0
+        rfn_sum = torch.tensor(0.0).cuda()
         rfn_count = 0
         logprob_sum = 0.0
         logprob_count = 0
@@ -451,7 +458,7 @@ def quant(job, save_fn, model):
                 output_ref = target_states[i].to("cuda:0")
                 output_ref = output_ref[0].float()
 
-                rfn_sum += (torch.linalg.norm(output - output_ref, 'fro') / torch.linalg.norm(output_ref, 'fro')).item()
+                rfn_sum += torch.linalg.norm(output - output_ref, 'fro') / torch.linalg.norm(output_ref, 'fro')
                 rfn_count += 1
 
                 output_ref = None
@@ -478,7 +485,7 @@ def quant(job, save_fn, model):
 
         if mode != "linear":
 
-            err = rfn_sum / rfn_count
+            err = rfn_sum.item() / rfn_count
             print(f" -- Module quantized, rfn_error: {err:1.6f}")
 
         else:
@@ -527,3 +534,5 @@ def quant(job, save_fn, model):
             save_fn()
 
             last_snapshot_time = time.time()
+
+    print_stage(job, "Quantizing", len(model.modules), len(model.modules))

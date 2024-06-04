@@ -1,6 +1,7 @@
 from exllamav2.model import \
 (
     ExLlamaV2Embedding,
+    ExLlamaV2PosEmbedding,
     ExLlamaV2Attention,
     ExLlamaV2MLP,
     ExLlamaV2MoEMLP,
@@ -16,6 +17,7 @@ import torch
 import os, glob, shutil, json
 from safetensors import safe_open
 from safetensors.torch import save_file
+from conversion.bot_status import print_stage
 
 def _tsize(t):
 
@@ -66,6 +68,10 @@ def compile_model(job, save_fn, model):
         module = model.modules[index]
 
         if isinstance(module, ExLlamaV2Embedding):
+
+            d = get_f_module(job, module); out_dict.update(d); current_size += _dsize(d)
+
+        if isinstance(module, ExLlamaV2PosEmbedding):
 
             d = get_f_module(job, module); out_dict.update(d); current_size += _dsize(d)
 
@@ -125,6 +131,8 @@ def compile_model(job, save_fn, model):
         # Save shard
 
         if current_size > shard_bytes or index == len(model.modules):
+
+            print_stage(job, "Compiling", index, len(model.modules))
 
             save_dict = {}
             dont_save_dict = {}
@@ -237,3 +245,5 @@ def compile_model(job, save_fn, model):
 
         with open(config_json, "w") as f:
             f.write(json.dumps(config_dict, indent = 4))
+
+    print_stage(job, "Compiling", len(model.modules), len(model.modules))
