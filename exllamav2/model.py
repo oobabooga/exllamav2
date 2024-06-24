@@ -21,11 +21,15 @@ os.environ["CUDA_MODULE_LOADING"] = "LAZY"
 #         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
 
 import torch
-
 if not (torch.version.cuda or torch.version.hip):
     print("")
     print(f" ## Warning: The installed version of PyTorch is {torch.__version__} and does not support CUDA or ROCm.")
     print("")
+
+# PyTorch, especially v2.3.1, gets confused when working with small CPU tensors and likes to use way too many worker
+# threads for small operations, adding considerable overhead. Limit it to a single thread to avoid that (globally
+# because that seems to be the only way)
+torch.set_num_threads(1)
 
 import math
 from exllamav2.config import ExLlamaV2Config
@@ -48,6 +52,7 @@ import threading
 from typing import Callable
 # from exllamav2.util import list_live_tensors, print_vram_usage, set_snapshot, diff_snapshot, print_vram_usage_peak
 from exllamav2.util import get_basic_progress
+# from line_profiler import profile
 
 
 def _torch_device(idx):
@@ -818,6 +823,7 @@ class ExLlamaV2:
 
 
     @torch.inference_mode()
+    # @profile
     def forward_chunk(self,
                       input_ids: torch.Tensor,
                       cache: ExLlamaV2CacheBase | list[ExLlamaV2CacheBase] | None = None,
@@ -867,6 +873,7 @@ class ExLlamaV2:
                 past_len = attn_params.past_len
                 cache.current_seq_len = past_len
 
+        device = self.modules[0].device_idx
         for idx, module in enumerate(self.modules):
 
             if idx == self.head_layer_idx and last_id_only:
@@ -884,9 +891,11 @@ class ExLlamaV2:
 
             # Onward
 
-            device = _torch_device(module.device_idx)
+            n_device = _torch_device(module.device_idx)
+            if n_device != device:
+                x = safe_move_tensor(x, n_device, non_blocking = True)
+                device = n_device
 
-            x = safe_move_tensor(x, device)
             x = module.forward(x, cache = cache, attn_params = attn_params, past_len = past_len, loras = loras, **kwargs)
 
             if preprocess_only and idx == self.last_kv_layer_idx:

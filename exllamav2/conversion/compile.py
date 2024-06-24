@@ -17,7 +17,7 @@ import torch
 import os, glob, shutil, json
 from safetensors import safe_open
 from safetensors.torch import save_file
-from conversion.bot_status import print_stage
+from exllamav2.conversion.bot_status import print_stage
 
 def _tsize(t):
 
@@ -149,7 +149,7 @@ def compile_model(job, save_fn, model):
             if len(save_dict) == 0:
 
                 print(f" ## Error: Unable to fit output tensor in single shard.")
-                os._exit(0)
+                os._exit(1)
 
             while True:
 

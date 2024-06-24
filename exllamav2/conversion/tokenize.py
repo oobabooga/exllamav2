@@ -3,7 +3,7 @@ import pandas, fastparquet
 import os
 from safetensors.torch import save_file
 import random
-from conversion.bot_status import print_stage
+from exllamav2.conversion.bot_status import print_stage
 
 def get_tokens(num_rows, length, filename, tokenizer):
 
@@ -48,6 +48,10 @@ def tokenize(job, save_fn, tokenizer, measure = False):
         cal_tokens = get_tokens(rows, length, cal_ds, tokenizer)
     else:
         cal_tokens = get_standard_calibration(job, measure, tokenizer)
+        if measure:
+            job["measurement_rows"] = cal_tokens.shape[0]
+        else:
+            job["dataset_rows"] = cal_tokens.shape[0]
 
     cal_filename = os.path.join(job["out_dir"], "cal_data.safetensors")
     cal_dict = { "input_ids": cal_tokens }

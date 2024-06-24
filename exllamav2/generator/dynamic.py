@@ -8,6 +8,7 @@ from exllamav2.attn import ExLlamaV2Attention, assert_paged_attn
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 from concurrent.futures import ThreadPoolExecutor
 
+from exllamav2.compat import pairwise
 import torch
 import random
 import numpy as np
@@ -397,19 +398,19 @@ class ExLlamaV2DynamicGenerator:
         self.logits_pinned = torch.empty(
             (max_batch_size, max_q_size, self.padded_vocab_size),
             dtype = torch.float,
-            pin_memory = True
+            pin_memory = False
         )
 
         if draft_model:
             self.draft_input_ids_pinned = torch.empty(
                 (max_batch_size, 1),
                 dtype = torch.long,
-                pin_memory = True
+                pin_memory = False
             )
             self.draft_ids_pinned = torch.empty(
                 (max_batch_size, num_draft_tokens),
                 dtype = torch.long,
-                pin_memory = True
+                pin_memory = False
             )
 
         # Ngram
@@ -827,8 +828,9 @@ class ExLlamaV2DynamicGenerator:
                 batch_size = batch_size,
                 block_index = block_index,
                 cache_seqlens = cache_seqlens,
+                max_cache_seqlen = cache_seqlens.max().item(),
                 page_size = self.page_size,
-                q_len = q_len
+                q_len = q_len,
             )
         else:
             assert cache_seqlens.shape[0] == 1
@@ -1057,7 +1059,8 @@ class ExLlamaV2DynamicGenerator:
         batch_size = 0
         max_seq_len = 0
         for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
+            if not job.is_prefill_done():
+                continue
             max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens)
             batch_size += len(job.sequences)
 
@@ -1329,7 +1332,7 @@ class ExLlamaV2DynamicGenerator:
             rotation = [r * self.page_size for r in rotation]
             for cache, buffer in zip(cache_tensors, defrag_buffers):
                 buffer[:, :, :, :].copy_(cache[:, rotation[0] : rotation[0] + self.page_size, :, :])
-                for a, b in itertools.pairwise(rotation):
+                for a, b in pairwise(rotation):
                     cache[:, a : a + self.page_size, :, :].copy_(cache[:, b : b + self.page_size, :, :])
                 cache[:, rotation[-1] : rotation[-1] + self.page_size, :, :].copy_(buffer[:, :, :, :])
 
@@ -1442,9 +1445,11 @@ class ExLlamaV2DynamicJob:
     # Stop conditions
 
     stop_strings: set
+    stop_strings_list: list
     stop_strings_utf32_buffer: np.array or None
     stop_strings_utf32_offsets: np.array or None
     stop_tokens: set
+    stop_tokens_list: list
 
     # Banned strings
 
@@ -1608,6 +1613,9 @@ class ExLlamaV2DynamicJob:
         else:
             self.stop_strings_utf32_buffer, self.stop_strings_utf32_offsets = None, None
 
+        self.stop_tokens_list = list(self.stop_tokens)
+        self.stop_strings_list = list(self.stop_strings)
+
         # Banned strings
 
         if banned_strings:
@@ -1717,9 +1725,9 @@ class ExLlamaV2DynamicJob:
 
         if self.new_tokens < self.min_new_tokens:
             if blocked_tokens:
-                blocked_tokens += list(self.stop_tokens)
+                blocked_tokens += self.stop_tokens_list
             else:
-                blocked_tokens = list(self.stop_tokens)
+                blocked_tokens = self.stop_tokens_list
 
         next_token, next_k_tokens, next_k_probs, next_prob, filter_eos = \
         ExLlamaV2Sampler.sample(
@@ -2106,40 +2114,40 @@ class ExLlamaV2DynamicJob:
             if seq.prefill_complete:
                 continue
 
-            prefill_start = seq.kv_position
-            prefill_end = seq.kv_position + self.generator.max_chunk_size
             if self.generator.paged:
-                prefill_end = (prefill_end // page_size) * page_size
-            prefill_end = min(prefill_end, len(seq.sequence_ids) - 1)
 
-            p0 = prefill_start // page_size
-            p1 = (prefill_end + page_size - 1) // page_size
-            for local_idx in range(p0, p1):
-                page = seq.allocated_pages[local_idx]
-                if page.kv_position == page_size:
-                    prefill_start = (local_idx + 1) * page_size
-                    seq.kv_position = prefill_start
-                    self.cached_pages += 1
-                    page.can_revert = False
-                else:
-                    break
+                prefill_start = seq.kv_position
+                prefill_end = seq.kv_position + self.generator.max_chunk_size
+                if self.generator.paged:
+                    prefill_end = (prefill_end // page_size) * page_size
+                prefill_end = min(prefill_end, len(seq.sequence_ids) - 1)
 
-            p0 = prefill_start // page_size
-            for local_idx in range(p0, p1):
-                page = seq.allocated_pages[local_idx]
-                if page.kv_position == page_size:
-                    prefill_end = local_idx * page_size
-                    break
+                p0 = prefill_start // page_size
+                p1 = (prefill_end + page_size - 1) // page_size
+                for local_idx in range(p0, p1):
+                    page = seq.allocated_pages[local_idx]
+                    if page.kv_position == page_size:
+                        prefill_start = (local_idx + 1) * page_size
+                        seq.kv_position = prefill_start
+                        self.cached_pages += 1
+                        page.can_revert = False
+                    else:
+                        break
 
-            if prefill_end <= prefill_start:
-                continue
+                p0 = prefill_start // page_size
+                for local_idx in range(p0, p1):
+                    page = seq.allocated_pages[local_idx]
+                    if page.kv_position == page_size:
+                        prefill_end = local_idx * page_size
+                        break
 
-            prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
+                if prefill_end <= prefill_start:
+                    continue
 
-            # Special case for partial last page, check if there's a page anywhere in the cache that
-            # partially matches, then copy keys/values from there
+                prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
-            if self.generator.paged:
+                # Special case for partial last page, check if there's a page anywhere in the cache that
+                # partially matches, then copy keys/values from there
 
                 p0 = prefill_start // page_size
                 p1 = prefill_end // page_size
@@ -2178,19 +2186,34 @@ class ExLlamaV2DynamicJob:
 
             # In unpaged mode there is only one page to compare against
 
-            elif seq.kv_position == 0:
+            else:
+                prefill_start = seq.kv_position
+                progress = prefill_start
                 page = self.generator.all_pages[0]
-                assert page.can_revert
-                match = ext_c.count_match(page.sequence, prefill_ids, page.kv_position_revert)
-                if match:
-                    prefill_start += match
+
+                prefill_ids = seq.sequence_ids.torch()[:, prefill_start:-1]
+                if prefill_start == 0:
+                    match = ext_c.count_match(
+                        page.sequence[:, prefill_start:],
+                        prefill_ids,
+                        min(page.kv_position_revert, len(seq.sequence_ids) - 1)
+                    )
                     prefill_ids = prefill_ids[:, match:]
-                    prefill_end = min(prefill_end + match, len(seq.sequence_ids) - 1)
-                    seq.kv_position += match
-                    page.kv_position = match
-                    page.backup()
+                    seq.kv_position = prefill_start + match
+                    page.kv_position = prefill_start + match
+                    prefill_start += match
                     self.cached_tokens += match
                     progress += match
+
+                prefill_end = min(seq.kv_position + self.generator.max_chunk_size, len(seq.sequence_ids) - 1)
+                if prefill_end <= prefill_start:
+                    seq.prefill_complete = True
+                    continue
+
+                assert page.can_revert
+
+                prefill_ids = prefill_ids[:, :self.generator.max_chunk_size]
+                p0 = p1 = 0
 
             # Inference
 
@@ -2211,6 +2234,9 @@ class ExLlamaV2DynamicJob:
                         cache = self.generator.draft_cache,
                     )
 
+                if not self.generator.paged:
+                    self.generator.cache.current_seq_len = prefill_start
+
                 self.generator.model.forward_chunk(
                     input_ids = prefill_ids,
                     preprocess_only = True,
@@ -2221,24 +2247,33 @@ class ExLlamaV2DynamicJob:
 
                 seq.kv_position = prefill_end
 
-                p2 = min(p1 + 1, len(seq.allocated_pages))
-                for local_idx in range(p0, p2):
-                    page = seq.allocated_pages[local_idx]
-                    page.kv_position = min(max(prefill_end - local_idx * page_size, 0), page_size)
-                    if local_idx == 0:
-                        page.prev_hash = None
-                    else:
-                        page.prev_hash = seq.allocated_pages[local_idx - 1].phash
-                    pf_a = max(local_idx * page_size, prefill_start)
-                    pf_b = min(local_idx * page_size + page_size, prefill_end)
-                    pfp_a = pf_a - local_idx * page_size
-                    pfp_b = pf_b - local_idx * page_size
-                    page.sequence[:, pfp_a:pfp_b].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
-                    page.can_revert = False
+                if self.generator.paged:
+                    p2 = min(p1 + 1, len(seq.allocated_pages))
+                    for local_idx in range(p0, p2):
+                        page = seq.allocated_pages[local_idx]
+                        page.kv_position = min(max(prefill_end - local_idx * page_size, 0), page_size)
+                        if local_idx == 0:
+                            page.prev_hash = None
+                        else:
+                            page.prev_hash = seq.allocated_pages[local_idx - 1].phash
+                        pf_a = max(local_idx * page_size, prefill_start)
+                        pf_b = min(local_idx * page_size + page_size, prefill_end)
+                        pfp_a = pf_a - local_idx * page_size
+                        pfp_b = pf_b - local_idx * page_size
+                        page.sequence[:, pfp_a:pfp_b].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
+                        page.can_revert = False
+                else:
+                    page = seq.allocated_pages[0]
+                    page.kv_position = prefill_end
+                    page.prev_hash = None
+                    page.sequence[:, prefill_start:prefill_end].copy_(seq.sequence_ids.torch_slice(prefill_start, prefill_end))
 
                 progress += prefill_end - prefill_start
                 if progress >= len(seq.sequence_ids) - 1:
                     seq.prefill_complete = True
+                    if not self.generator.paged:
+                        page = seq.allocated_pages[0]
+                        page.can_revert = False
 
         if progress:
             r = {
@@ -2358,7 +2393,7 @@ class ExLlamaV2DynamicJob:
             # Metrics
 
             self.total_pages += len(seq.allocated_pages)
-            for page_a, page_b in itertools.pairwise(seq.allocated_pages):
+            for page_a, page_b in pairwise(seq.allocated_pages):
                 if page_b.page_index != page_a.page_index + 1:
                     self.non_sequential_pages += 1
 
@@ -2366,6 +2401,9 @@ class ExLlamaV2DynamicJob:
 
 
     def deallocate_pages(self):
+
+        if not self.generator.paged:
+            self.generator.all_pages[0].backup()
 
         for seq in self.sequences:
             for page in seq.allocated_pages:

@@ -15,6 +15,7 @@ from exllamav2.architecture import RopeStyle
 import math
 # from exllamav2.util import list_live_tensors, set_snapshot, diff_snapshot, print_vram_usage_peak
 import torch.nn.functional as F
+# from line_profiler import profile
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -39,6 +40,8 @@ try:
 
     if [2, 5, 7] <= flash_attn_ver:
         from flash_attn import flash_attn_func, flash_attn_with_kvcache
+        import flash_attn_2_cuda as flash_attn_cuda
+
         has_flash_attn = True
         has_flash_attn_with_paged = True
 
@@ -49,7 +52,7 @@ has_xformers = False
 try:
     import xformers.ops as xops
     # LowerTriangularFromBottomRightMask was added in xformers version 2.4
-    from xformers.ops.fmha import LowerTriangularFromBottomRightMask
+    from xformers.ops.fmha.attn_bias import LowerTriangularFromBottomRightMask
     has_xformers = True
 except ModuleNotFoundError:
     pass
@@ -206,6 +209,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
         block_index: torch.Tensor
         cache_seqlens: torch.Tensor
+        max_cache_seqlen: int
         page_size: int
         is_sequential: bool
         first_index: int
@@ -215,6 +219,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             batch_size: int,
             block_index: torch.Tensor,
             cache_seqlens: torch.Tensor,
+            max_cache_seqlen: int,
             page_size: int,
             q_len: int = 0
         ):
@@ -225,6 +230,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
             self.block_index = block_index
             self.cache_seqlens = cache_seqlens
+            self.max_cache_seqlen = max_cache_seqlen
             self.page_size = page_size
 
             self.is_sequential = False
@@ -252,14 +258,14 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 self.block_index = safe_move_tensor(self.block_index, device)
             return self.block_index
 
-        def get_cache_seqlens(self, device) -> torch.Tensor:
-            if self.cache_seqlens.device != device:
-                self.cache_seqlens = safe_move_tensor(self.cache_seqlens, device)
+        def get_cache_seqlens(self, device_idx: int) -> torch.Tensor:
+            if self.cache_seqlens.device.index != device_idx:
+                self.cache_seqlens = safe_move_tensor(self.cache_seqlens, device_idx, non_blocking = True)
             return self.cache_seqlens
 
-        def get_cache_seqlens_after(self, device) -> torch.Tensor:
-            if self.cache_seqlens_after.device != device:
-                self.cache_seqlens_after = safe_move_tensor(self.cache_seqlens_after, device)
+        def get_cache_seqlens_after(self, device_idx: int) -> torch.Tensor:
+            if self.cache_seqlens_after.device.index != device_idx:
+                self.cache_seqlens_after = safe_move_tensor(self.cache_seqlens_after, device_idx, non_blocking = True)
             return self.cache_seqlens_after
 
 
@@ -543,6 +549,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         return hidden_states
 
 
+    # @profile
     def forward_paged(self,
                       hidden_states: torch.Tensor,
                       cache: ExLlamaV2CacheBase | None = None,
@@ -555,17 +562,21 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         constants = self.model.get_device_tensors(self.device_idx, scratch = is_q)
         page_size = attn_params.page_size
         batch_size, q_len, _ = hidden_states.shape
-        cache_seqlens = attn_params.get_cache_seqlens(self.device())
-        block_table = attn_params.get_block_index(self.device())
+        cache_seqlens = attn_params.get_cache_seqlens(self.device_idx)
+        block_table = attn_params.get_block_index(self.device_idx)
 
-        # TODO: We only need keys/values when preprocess_only == True, so we could skip q projection and attention.
-        #   Would need custom kernel to update paged cache if not calling flash_attn_with_kvcache
+        # TODO: We only need keys/values when preprocess_only == True, so we could skip q projection and attention
+        #   on the last layer. Would need custom kernel to update paged cache if not calling flash_attn_with_kvcache
         # skip_attn = kwargs.get("kv_only")
 
         # TODO: Potentially we could emulate paged cache when in Q4 mode, since that requires copying the active part
         #   of the current cache layer anyway. Test if block diagonal masking works with lower-right aligned mask.
 
-        k_cache_f, v_cache_f = cache.get_kv_state(self.layer_idx, batch_size, 0, 1, page_size, cache_seqlens, block_table)
+        if cache.q_block > 1:
+            k_cache_f, v_cache_f = cache.get_kv_state(self.layer_idx, batch_size, 0, attn_params.max_cache_seqlen, page_size, cache_seqlens, block_table)
+        else:
+            k_cache_f, v_cache_f = cache.get_kv_state(self.layer_idx, batch_size, 0, 0, page_size, cache_seqlens, block_table)
+
         k_cache = k_cache_f.view(k_cache_f.shape[1] // page_size, page_size, k_cache_f.shape[2], k_cache_f.shape[3])
         v_cache = v_cache_f.view(v_cache_f.shape[1] // page_size, page_size, v_cache_f.shape[2], v_cache_f.shape[3])
 
@@ -592,7 +603,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 batch_size,
                 q_len,
                 0,
-                attn_params.get_cache_seqlens(self.device()),
+                cache_seqlens,
                 q,
                 k,
                 v,
@@ -622,7 +633,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                         0,
                         heads,
                         cfg.head_dim,
-                        attn_params.get_cache_seqlens(self.device()),
+                        cache_seqlens,
                         cfg.arch.rope_style == RopeStyle.NEOX
                     )
             if attn_params.is_sequential:
@@ -634,19 +645,36 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         if attn_params.is_sequential:
             k = None
             v = None
-            cache_seqlens_a = attn_params.get_cache_seqlens_after(self.device())
+            cache_seqlens_a = attn_params.get_cache_seqlens_after(self.device_idx)
         else:
             cache_seqlens_a = cache_seqlens
 
-        attn_output = flash_attn_with_kvcache(
-            q = q,
-            k = k,
-            v = v,
-            k_cache = k_cache,
-            v_cache = v_cache,
-            cache_seqlens = cache_seqlens_a,
-            block_table = block_table,
-            causal = True
+        if cache.q_block == 1:
+            cache.get_kv_state(self.layer_idx, batch_size, 0, attn_params.max_cache_seqlen, page_size, cache_seqlens, block_table)
+
+        # attn_output = flash_attn_with_kvcache(
+        #     q = q,
+        #     k = k,
+        #     v = v,
+        #     k_cache = k_cache,
+        #     v_cache = v_cache,
+        #     cache_seqlens = cache_seqlens_a,
+        #     block_table = block_table,
+        #     causal = True
+        # )
+        attn_output, _ = flash_attn_cuda.fwd_kvcache(
+            q, k_cache, v_cache, k, v,
+            cache_seqlens_a,
+            None, None,
+            None,
+            block_table,
+            None,
+            None,
+            1 / math.sqrt(cfg.head_dim),
+            True,
+            -1, -1,
+            True,
+            0,
         )
         attn_output = attn_output.view((batch_size, q_len, cfg.num_attention_heads * cfg.head_dim))
 
@@ -674,7 +702,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
     def _attn_torch(self, batch_size, q_len, q_states, k_states, v_states, attn_params, cfg):
 
-        if has_lower_right_sdpa and attn_params.is_causal():
+        if has_lower_right_sdpa and attn_params.is_causal() and not cfg.no_sdpa:
 
             q_states = q_states.transpose(1, 2)
             k_states = k_states.transpose(1, 2)
@@ -749,6 +777,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         return attn_output
 
 
+    # @profile
     def forward(self,
                 hidden_states: torch.Tensor,
                 cache: ExLlamaV2CacheBase | None = None,

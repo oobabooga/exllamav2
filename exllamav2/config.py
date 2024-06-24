@@ -56,8 +56,9 @@ class ExLlamaV2Config:
     scale_pos_emb: float                        # Factor by which to scale positional embeddings, e.g. for 4096-token sequence use a scaling factor of 2.0, requires finetuned model or LoRA
     scale_alpha_value: float                    # Alpha value for NTK RoPE scaling. Similar to compress_pos_emb but works without finetuned model
 
-    no_flash_attn: bool                         # Implementation will automatically use flash-attn-2 when available
-    no_xformers: bool                           # Implementation will automatically use xformers for sm<80 when available, unless flash-attn-2 is available
+    no_flash_attn: bool                         # Implementation will automatically use flash-attn-2 when available, set True to override
+    no_xformers: bool                           # Implementation will automatically use xformers for sm<80 when available, unless flash-attn-2 is available, set True to override
+    no_sdpa: bool                               # Do not use Torch SDPA even if causal_lower_right bias is available (seems to be unreliable on ROCm (?))
     fasttensors: bool                           # Use alternative .safetensors loader (aio on Linux, cstdio on Windows). Not always faster but can address excessive use of system RAM in some situations
     load_in_q4: bool                            # Load float linear layers in Q4 format (for test/dev purposes, not performant)
 
@@ -122,6 +123,7 @@ class ExLlamaV2Config:
 
         self.no_flash_attn = 'EXLLAMA_NO_FLASH_ATTN' in os.environ
         self.no_xformers = 'EXLLAMA_NO_XFORMERS' in os.environ
+        self.no_sdpa = 'EXLLAMA_NO_SDPA' in os.environ
         self.fasttensors = 'EXLLAMA_FASTTENSORS' in os.environ
         self.load_in_q4 = False
 
@@ -140,7 +142,7 @@ class ExLlamaV2Config:
 
         self.max_input_len = 1024
         self.max_attention_size = 1024 ** 2
-        self.max_output_len = min(self.max_output_len, 1024)
+        self.max_output_len = None if self.max_output_len is None else min(self.max_output_len, 1024)
 
 
     # Populate config with required files from model_dir
