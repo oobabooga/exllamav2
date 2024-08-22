@@ -1,8 +1,7 @@
 from __future__ import annotations
 from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
-import gc
+import gc, subprocess, time, os, json
 import torch
-import time
 
 
 class Timer:
@@ -215,3 +214,157 @@ def print_vram_usage_peak():
     print(f"Peak memory: {mem_this / (1024 ** 2):,.2f} MB")
 
 
+def get_visible_devices():
+
+    visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+    if visible_devices is None:
+        return None
+    return [int(dev) for dev in visible_devices.split(',')]
+
+
+def get_nvidia_gpu_memory(visible_devices=None):
+
+    """
+    Get the current GPU usage for NVIDIA GPUs.
+    TODO: Find a better way to respect CUDA_VISIBLE_DEVICES, perhaps pynvml?
+    """
+
+    result = subprocess.run(
+        [
+            'nvidia-smi',
+            '--query-gpu=index,memory.total,memory.used,memory.free',
+            '--format=csv,nounits,noheader'
+        ],
+        stdout = subprocess.PIPE, encoding = 'utf-8'
+    )
+
+    gpu_memory = {}
+    for line in result.stdout.strip().split('\n'):
+        index, total, used, free = map(int, line.split(','))
+        if visible_devices is None or index in visible_devices:
+            gpu_memory[index] = {'total': total, 'used': used, 'free': free}
+    if visible_devices is not None:
+        gpu_memory = { idx: gpu_memory[d] for idx, d in enumerate(visible_devices) }
+
+    return gpu_memory
+
+
+def get_amd_gpu_memory():
+
+    """
+    Get the current GPU usage for AMD GPUs.
+    TODO: Test on ROCm
+    """
+
+    result = subprocess.run(
+        [
+            'rocm-smi',
+            '--showmeminfo',
+            'vram',
+            '--json'
+        ],
+        stdout=subprocess.PIPE, encoding='utf-8'
+    )
+
+    data = json.loads(result.stdout)
+
+    gpu_memory = {}
+    for gpu in data['card']:
+        index = gpu['card_id']
+        total = int(gpu['vram_total'])
+        used = int(gpu['vram_used'])
+        free = int(gpu['vram_free'])
+        gpu_memory[index] = {'total': total, 'used': used, 'free': free}
+
+    return gpu_memory
+
+
+def get_all_gpu_memory():
+
+    """
+    Get the current GPU usage for both NVIDIA and AMD GPUs.
+    """
+
+    gpu_memory = {}
+    visible_devices = get_visible_devices()
+
+    try:
+        nvidia_memory = get_nvidia_gpu_memory(visible_devices)
+        gpu_memory.update(nvidia_memory)
+    except FileNotFoundError:
+        pass
+        # print("nvidia-smi not found. Skipping NVIDIA GPU check.")
+
+    try:
+        amd_memory = get_amd_gpu_memory()
+        gpu_memory.update(amd_memory)
+    except FileNotFoundError:
+        pass
+        # print("rocm-smi not found. Skipping AMD GPU check.")  # TODO: remove warning on NVidia, test on AMD
+
+    assert gpu_memory, \
+        "Unable to read available VRAM from nvidia-smi or rocm-smi"
+
+    return gpu_memory
+
+
+def integer_split(x, split: list[int], minimum: int = 0) -> list[int]:
+
+    """
+    Precisely split x integer into portions according to given ratio, ensuring sum(portions) == x
+    """
+
+    sum_split = sum(split)
+    portions = [int(x * p / sum_split) for p in split]
+    remaining = x - sum(portions)
+    remainders = [(x * p / sum_split) - initial for p, initial in zip(split, portions)]
+    for i in range(remaining):
+        max_index = remainders.index(max(remainders))
+        portions[max_index] += 1
+        remainders[max_index] -= 1
+    adjust = sum((p if p < minimum else 0) for p in portions)
+    portions = [(p if p >= minimum else 0) for p in portions]
+    for i in range(adjust):
+        min_index = min((i for i, v in enumerate(portions) if v != 0), key = lambda i: portions[i], default = -1)
+        portions[min_index] += 1
+    return portions
+
+
+def unpack_4bit(packed: torch.Tensor):
+    """
+    :param packed:
+        (m, n // 8) tensor, dtype torch.int32/uint32, packed 4-bit ints
+    :return:
+        (m, n) tensor, dtype torch.int8
+    TODO: CUDA kernel for this
+    """
+
+    m, n8 = packed.shape
+    n = n8 * 8
+    assert packed.dtype in [torch.int32]
+
+    # packed = packed.view(torch.uint32)
+    unpacked = torch.empty((m, n), dtype = torch.uint8, device = packed.device)
+    for i in range(8):
+        unpacked[:, i::8] = (packed >> (i * 4)) & 0xF
+    return unpacked
+
+
+def pack_4bit(unpacked: torch.Tensor):
+    """
+    :param unpacked:
+        (m, n) tensor, dtype torch.int8, packed 4-bit ints
+    :return:
+        (m, n, // 8) tensor, dtype torch.int32
+    TODO: CUDA kernel for this
+    """
+
+    m, n = unpacked.shape
+    assert n % 8 == 0
+    assert unpacked.dtype == torch.uint8
+
+    packed = torch.zeros((m, n // 8), dtype = torch.int64, device = unpacked.device)
+    for i in range(8):
+        packed |= (unpacked[:, i::8].to(torch.int64) << (i * 4))
+    packed = packed.to(torch.int32)
+    return packed

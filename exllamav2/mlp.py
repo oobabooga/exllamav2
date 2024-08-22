@@ -8,6 +8,7 @@ from exllamav2.layernorm import ExLlamaV2LayerNorm
 from exllamav2.linear import ExLlamaV2Linear
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 from exllamav2.lora import ExLlamaV2Lora
+from exllamav2.tensor_p import BROADCAST_ID, BROADCAST_RS
 # from line_profiler import profile
 
 from typing import TYPE_CHECKING
@@ -33,6 +34,10 @@ class ExLlamaV2MLP(ExLlamaV2Module):
     has_norm: bool
     has_residual: bool
 
+    is_tp: bool
+    tp_dq_size: list[int] | None
+
+
     def __init__(self,
                  model: ExLlamaV2,
                  key: str,
@@ -42,6 +47,9 @@ class ExLlamaV2MLP(ExLlamaV2Module):
 
         super().__init__(model, key)
         cfg = self.model.config
+
+        self.is_tp = False
+        self.tp_dq_size = None
 
         self.layer_idx = layer_idx
         self.has_norm = has_norm
@@ -100,7 +108,8 @@ class ExLlamaV2MLP(ExLlamaV2Module):
 
 
     @torch.inference_mode
-    def load(self):
+    def load(self,
+             device_context: bool = True):
 
         cfg = self.model.config
 
@@ -114,19 +123,30 @@ class ExLlamaV2MLP(ExLlamaV2Module):
             w1 = nn.Parameter(w12[:cfg.intermediate_size, :].contiguous())
             w2 = nn.Parameter(w12[cfg.intermediate_size:, :].contiguous())
             w3 = self.load_weight(self.key + cfg.arch.fused_mlp_key_3)
-            self.gate_proj.load(w1)
-            self.up_proj.load(w2)
-            self.down_proj.load(w3)
+            self.down_proj.load(w3, device_context = device_context)
+            self.gate_proj.load(w1, device_context = device_context)
+            self.up_proj.load(w2, device_context = device_context)
         else:
-            if self.gate_proj is not None: self.gate_proj.load()
-            self.up_proj.load()
-            self.down_proj.load()
+            down_map = self.down_proj.load(device_context = device_context, unmap = True)
+            if self.gate_proj is not None: self.gate_proj.load(device_context = device_context, output_map = down_map)
+            self.up_proj.load(device_context = device_context, output_map = down_map)
 
         if self.up_proj.is_quant():
             assert self.gate_proj is None or self.gate_proj.is_quant()
             assert self.up_proj.is_quant(), "Partially quantized MLP layer"
-            device_tensors = self.model.get_device_tensors(self.device_idx)
-            device_tensors.begin_scratch_alloc()
+
+            if device_context:
+                device_context = self.model.get_device_context(self.device_idx)
+                device_context.begin_scratch_alloc()
+                temp_state = device_context.get_scratch_slice(self.temp_state_size())
+                temp_a = device_context.get_scratch_slice(self.temp_a_size())
+                temp_b = device_context.get_scratch_slice(self.temp_b_size())
+                temp_dq = device_context.get_scratch_slice(self.temp_dq_size())
+            else:
+                temp_state = none_tensor
+                temp_a = none_tensor
+                temp_b = none_tensor
+                temp_dq = none_tensor
 
             if self.has_norm:
                 norm_weight = self.pre_layernorm.weight if self.pre_layernorm.weight is not None else none_tensor
@@ -146,23 +166,26 @@ class ExLlamaV2MLP(ExLlamaV2Module):
                 post_norm_weight = none_tensor
                 post_norm_bias = none_tensor
 
-            self.q_handle = ext_c.make_q_mlp(norm_weight,
-                                             norm_bias,
-                                             is_rms,
-                                             eps,
-                                             0 if self.gate_proj is None else self.gate_proj.q_handle,
-                                             self.up_proj.q_handle,
-                                             self.down_proj.q_handle,
-                                             device_tensors.get_scratch_slice(self.temp_state_size()),
-                                             device_tensors.get_scratch_slice(self.temp_a_size()),
-                                             device_tensors.get_scratch_slice(self.temp_b_size()),
-                                             device_tensors.get_scratch_slice(self.temp_dq_size()),
-                                             cfg.max_input_len * cfg.max_batch_size,
-                                             cfg.arch.mlp_act_func == "gelu",
-                                             self.has_residual,
-                                             post_norm_weight,
-                                             post_norm_bias,
-                                             cfg.arch.residual_stream_fp32)
+            self.q_handle = ext_c.make_q_mlp(
+                norm_weight,
+                norm_bias,
+                is_rms,
+                eps,
+                0 if self.gate_proj is None else self.gate_proj.q_handle,
+                self.up_proj.q_handle,
+                self.down_proj.q_handle,
+                temp_state,
+                temp_a,
+                temp_b,
+                temp_dq,
+                cfg.max_input_len * cfg.max_batch_size,
+                cfg.arch.mlp_act_func == "gelu",
+                self.has_residual,
+                post_norm_weight,
+                post_norm_bias,
+                cfg.arch.residual_stream_fp32,
+                not cfg.no_graphs
+            )
 
 
     def unload(self):
@@ -239,7 +262,7 @@ class ExLlamaV2MLP(ExLlamaV2Module):
                    self.down_proj.temp_dq_size())
 
 
-    def set_device_idx(self, idx: int):
+    def set_device_idx(self, idx: int | None):
         super().set_device_idx(idx)
 
         if self.pre_layernorm is not None:
@@ -252,14 +275,27 @@ class ExLlamaV2MLP(ExLlamaV2Module):
 
 
     # @profile
-    def forward(self,
-                hidden_states: torch.Tensor,
-                cache = None,
-                attn_params = None,
-                past_len = None,
-                intermediates: bool = False,
-                loras: list[ExLlamaV2Lora] | None = None,
-                **kwargs) -> torch.Tensor | dict[str: torch.Tensor]:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache = None,
+        attn_params = None,
+        past_len = None,
+        intermediates: bool = False,
+        loras: list[ExLlamaV2Lora] | None = None,
+        **kwargs
+    ) -> torch.Tensor | dict[str: torch.Tensor]:
+
+        if self.is_tp:
+            return self.forward_tp(
+                hidden_states,
+                cache,
+                attn_params,
+                past_len,
+                intermediates,
+                loras,
+                **kwargs
+            )
 
         cfg = self.model.config
 
@@ -273,6 +309,7 @@ class ExLlamaV2MLP(ExLlamaV2Module):
             pass_loras = [id(x) for x in loras]
             pass_lora_temp = torch.empty((self.temp_lora_size,), dtype = torch.half, device = hidden_states.device)
 
+        # print (hidden_states.storage().data_ptr())
         ext_c.q_mlp_forward_(self.q_handle,
                              hidden_states,
                              pass_loras,
@@ -284,14 +321,105 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         return hidden_states
 
 
-    def forward_torch(self,
-                      hidden_states: torch.Tensor,
-                      cache = None,
-                      attn_params = None,
-                      past_len = None,
-                      intermediates: bool = False,
-                      loras: list[ExLlamaV2Lora] | None = None,
-                      **kwargs) -> torch.Tensor | dict[str: torch.Tensor]:
+    # @profile
+    def forward_tp(
+        self,
+        hidden_states: torch.Tensor,
+        cache = None,
+        attn_params = None,
+        past_len = None,
+        intermediates: bool = False,
+        loras: list[ExLlamaV2Lora] | None = None,
+        **kwargs
+    ) -> torch.Tensor | dict[str: torch.Tensor]:
+
+        cfg = self.model.config
+        ctx = self.model.tp_context
+
+        batch_size, q_len, _ = hidden_states.shape
+        hidden_states = hidden_states.view(-1, cfg.hidden_size)
+
+        ext_c.tp_mlp_forward_(
+            self.model.tp_context.ext_tp_context,
+            hidden_states,
+            self.temp_bc0,
+            self.temp_bc1,
+            self.temp_bc2,
+            self.temp_gate,
+            self.temp_up,
+            self.temp_down,
+            self.pre_layernorm.weight if self.pre_layernorm is not None else [],
+            self.pre_layernorm.variance_epsilon if self.pre_layernorm is not None else 0.0,
+            self.gate_proj.q_handle if self.gate_proj is not None else [],
+            self.up_proj.q_handle,
+            self.down_proj.q_handle,
+            cfg.arch.mlp_act_func == "gelu"
+        )
+
+        return ctx.get_pinned(0, batch_size, q_len, cfg.hidden_size)
+
+
+    def forward_tp_old(
+        self,
+        hidden_states: torch.Tensor,
+        cache = None,
+        attn_params = None,
+        past_len = None,
+        intermediates: bool = False,
+        loras: list[ExLlamaV2Lora] | None = None,
+        **kwargs
+    ) -> torch.Tensor | dict[str: torch.Tensor]:
+
+        cfg = self.model.config
+
+        batch_size, q_len, _ = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        hidden_states = self.model.tp_context.broadcast(0, hidden_states, BROADCAST_ID)
+
+        residual = hidden_states
+
+        post_norm = self.pre_layernorm.forward_tp(hidden_states, output_split = True) \
+            if self.pre_layernorm else hidden_states
+
+        gate = self.gate_proj.forward_tp(post_norm, output_split = True)
+        up = self.up_proj.forward_tp(post_norm, output_split = True)
+
+        outputs = []
+        for idx, hs in enumerate(post_norm):
+            dev = hs.device.index
+            context = self.model.get_device_context(dev)
+            torch.cuda.set_stream(context.stream)
+
+            if cfg.arch.mlp_act_func == "silu":
+                output = F.silu(gate[idx])
+            elif cfg.arch.mlp_act_func == "gelu":
+                output = F.gelu(gate[idx], approximate = "tanh")
+            output *= up[idx]
+            # output.clamp_(min = -65504.0, max = 65504.0)
+            outputs.append(output)
+
+        outputs = self.model.tp_context.allgather(1, outputs, BROADCAST_ID, BROADCAST_ID)
+
+        down = self.down_proj.forward_tp(outputs, output_split = True)
+
+        if self.has_residual:
+            self.model.tp_context.add_residual(down, residual, BROADCAST_RS)
+
+        down = self.model.tp_context.gather(0, down, BROADCAST_RS)
+        down = down.view(batch_size, q_len, down.shape[-1])
+        return down
+
+
+    def forward_torch(
+        self,
+        hidden_states: torch.Tensor,
+        cache = None,
+        attn_params = None,
+        past_len = None,
+        intermediates: bool = False,
+        loras: list[ExLlamaV2Lora] | None = None,
+        **kwargs
+    ) -> torch.Tensor | dict[str: torch.Tensor]:
 
         cfg = self.model.config
 
@@ -369,3 +497,66 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         if self.gate_proj is not None: self.gate_proj.rank_reduce(k)
         self.up_proj.rank_reduce(k)
         self.down_proj.rank_reduce(k)
+
+
+    def tp_split(self):
+
+        cfg = self.model.config
+        ctx = self.model.tp_context
+
+        if self.pre_layernorm is not None:
+            self.pre_layernorm.tp_split(BROADCAST_RS)
+        if self.post_layernorm is not None:
+            self.post_layernorm.tp_split(BROADCAST_RS)
+        if self.gate_proj is not None:
+            self.gate_proj.tp_split(BROADCAST_ID)
+        if self.up_proj is not None:
+            self.up_proj.tp_split(BROADCAST_ID)
+        if self.down_proj is not None:
+            self.down_proj.tp_split(BROADCAST_RS)
+
+        maxrows = cfg.max_batch_size * cfg.max_input_len
+        dtype = torch.half
+
+        ctx.begin_scratch_alloc_tp()
+        ctx.reserve_scratch(self.tp_dq_size)
+        self.temp_bc0 = ctx.get_scratch_slice_tp_bc(maxrows, dtype, BROADCAST_RS)
+        self.temp_bc1 = ctx.get_scratch_slice_tp_bc(maxrows, dtype, BROADCAST_RS)
+        self.temp_bc2 = ctx.get_scratch_slice_tp_bc(maxrows, dtype, BROADCAST_ID)
+        self.temp_gate = ctx.get_scratch_slice_tp(maxrows, dtype, BROADCAST_ID)
+        self.temp_up = ctx.get_scratch_slice_tp(maxrows, dtype, BROADCAST_ID)
+        self.temp_down = ctx.get_scratch_slice_tp(maxrows, dtype, BROADCAST_RS)
+
+        self.is_tp = True
+
+
+    def scratch_space_tp(self):
+
+        cfg = self.model.config
+        ctx = self.model.tp_context
+        devs = ctx.num_devices
+        scratch = [0] * devs
+
+        def add(res: list[int]):
+            for i, s in enumerate(res):
+                scratch[i] += s
+
+        def amax(res: list[int]):
+            for i, s in enumerate(res):
+                scratch[i] = max(scratch[i], s)
+
+        amax(self.gate_proj.scratch_space_tp(BROADCAST_ID, 1))
+        amax(self.up_proj.scratch_space_tp(BROADCAST_ID, 1))
+        amax(self.down_proj.scratch_space_tp(BROADCAST_RS, 1))
+        self.tp_dq_size = [s for s in scratch]
+
+        maxrows = cfg.max_batch_size * cfg.max_input_len
+
+        add(ctx.get_temp_tensors_bc_s(maxrows, 2, BROADCAST_RS))
+        add(ctx.get_temp_tensors_bc_s(maxrows, 2, BROADCAST_RS))
+        add(ctx.get_temp_tensors_bc_s(maxrows, 2, BROADCAST_ID))
+        add(ctx.get_temp_tensors_s(maxrows, 2, BROADCAST_ID))
+        add(ctx.get_temp_tensors_s(maxrows, 2, BROADCAST_ID))
+        add(ctx.get_temp_tensors_s(maxrows, 2, BROADCAST_RS))
+
+        return scratch

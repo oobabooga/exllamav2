@@ -12,6 +12,7 @@ from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 from exllamav2.compat import safe_move_tensor
 from exllamav2.lora import ExLlamaV2Lora
 from exllamav2.architecture import RopeStyle
+from exllamav2.tensor_p import BROADCAST_KV, BROADCAST_Q
 import math
 # from exllamav2.util import list_live_tensors, set_snapshot, diff_snapshot, print_vram_usage_peak
 import torch.nn.functional as F
@@ -47,14 +48,19 @@ if 'EXLLAMA_NO_FLASH_ATTN' not in os.environ:
             from flash_attn import flash_attn_func, flash_attn_with_kvcache
             # import flash_attn_2_cuda as flash_attn_cuda
 
+            signature = list(inspect.signature(flash_attn_func).parameters)
+            has_flash_attn_with_window = "window_size" in signature
+            has_flash_attn_with_softcap = "softcap" in signature
+
+            import flash_attn_2_cuda as flash_attn_cuda
+            # ext_c.set_flash_attn_func()
+
             has_flash_attn = True
             has_flash_attn_with_paged = True
 
-        signature = list(inspect.signature(flash_attn_func).parameters)
-        has_flash_attn_with_window = "window_size" in signature
-        has_flash_attn_with_softcap = "softcap" in signature
-
     except ModuleNotFoundError:
+        pass
+    except NameError:
         pass
 
 
@@ -116,176 +122,11 @@ class ExLlamaV2Attention(ExLlamaV2Module):
     scaling: float
     sliding_window: int
 
+    is_tp: bool
+    tp_dq_size: list[int] | None
 
-    class Params:
-
-        batch_size: int
-        seq_len: int
-        past_len: int | None
-        past_lens: list[int] | None
-        input_mask: torch.Tensor | None
-        multi_cache: bool
-        attn_mask: torch.Tensor | None
-        attn_masks: torch.Tensor | None
-        position_offsets: torch.Tensor | None
-        past_lens_tensor: torch.Tensor | None
-        paged: bool
-
-        def __init__(
-            self,
-            batch_size: int,
-            seq_len: int | None = None,
-            past_len: int | list[int] | None = None,
-            input_mask: torch.Tensor | None = None,
-            position_offsets: torch.Tensor | None = None,
-            paged = False
-        ):
-
-            self.batch_size = batch_size
-            self.paged = paged
-
-            if paged: return
-
-            self.seq_len = seq_len
-            if isinstance(past_len, list):
-                self.past_len = None
-                self.past_lens = past_len
-                self.multi_cache = True
-            else:
-                self.past_len = past_len
-                self.past_lens = None
-                self.multi_cache = False
-            self.input_mask = input_mask
-
-            self.attn_mask = None
-            self.attn_masks = None
-
-            self.position_offsets = position_offsets
-            self.past_lens_tensor = None
-            self.paged = paged
-
-
-        def is_causal(self) -> bool:
-            return self.input_mask is None
-
-        def get_position_offsets(self, device) -> torch.Tensor | None:
-            assert self.position_offsets is not None
-            if self.position_offsets.device != device:
-                self.position_offsets = safe_move_tensor(self.position_offsets, device)
-            return self.position_offsets
-
-        def get_past_lens(self, device) -> torch.Tensor | None:
-            assert self.past_lens is not None
-            if self.past_lens_tensor is None:
-                self.past_lens_tensor = torch.tensor(self.past_lens, dtype = torch.int, device = device)
-            elif self.past_lens_tensor.device != device:
-                self.past_lens_tensor = safe_move_tensor(self.past_lens_tensor, device)
-            return self.past_lens_tensor
-
-        def get_attn_mask(self, device, force: bool = False) -> torch.Tensor | None:
-            if self.attn_mask is None:
-                self.attn_mask = self.build_attn_mask(device, force)
-            elif self.attn_mask.device != device:
-                self.attn_mask = safe_move_tensor(self.attn_mask, device)
-            return self.attn_mask
-
-        def get_attn_masks(self, device) -> torch.Tensor | None:
-            if self.attn_masks is None:
-                self.attn_masks = self.build_attn_masks(device)
-            elif self.attn_masks[0] is not None and self.attn_masks[0].device != device:
-                self.attn_masks = [(safe_move_tensor(m, device) if m is not None else None) for m in self.attn_masks]
-            return self.attn_masks
-
-        def build_single_attn_mask(self, batch_size, seq_len, past_len, device, input_mask):
-            attn_mask = torch.zeros((batch_size, 1, seq_len, past_len + seq_len), dtype = torch.float16, device = device)
-            attn_mask_triu = torch.triu(torch.full((seq_len - 1, seq_len - 1), -65504.0))
-            attn_mask[:, :, : seq_len - 1, past_len + 1: past_len + seq_len] = attn_mask_triu
-            if input_mask is not None:
-                min_mask_width = min(input_mask.shape[-1], seq_len + past_len)
-                input_mask_part = safe_move_tensor(input_mask[:, :min_mask_width], attn_mask.device)
-                input_mask_part = input_mask_part.unsqueeze(1).unsqueeze(2)
-                attn_mask[:, :, :, :min_mask_width] = torch.minimum(attn_mask[:, :, :, :min_mask_width], input_mask_part)
-            return attn_mask
-
-        def build_attn_mask(self, device, force: bool = False) -> torch.Tensor | None:
-            assert not self.multi_cache, "Building single mask for multiple caches"
-            if self.input_mask is None and self.seq_len == 1 and not force: return None
-            return self.build_single_attn_mask(self.batch_size, self.seq_len, self.past_len, device, self.input_mask)
-
-        def build_attn_masks(self, device) -> torch.Tensor | None:
-            assert self.multi_cache, "Building multiple masks for single cache"
-            attn_masks = []
-            for i, past_len in enumerate(self.past_lens):
-                if self.input_mask is None and self.seq_len == 1:
-                    attn_masks.append(None)
-                else:
-                    attn_masks.append(self.build_single_attn_mask(1, self.seq_len, past_len, device, self.input_mask[i]))
-            return attn_masks
-
-
-    class PagedParams(Params):
-
-        block_index: torch.Tensor
-        cache_seqlens: torch.Tensor
-        max_cache_seqlen: int
-        page_size: int
-        is_sequential: bool
-        first_index: int
-
-        def __init__(
-            self,
-            batch_size: int,
-            block_index: torch.Tensor,
-            cache_seqlens: torch.Tensor,
-            max_cache_seqlen: int,
-            page_size: int,
-            q_len: int = 0
-        ):
-            super().__init__(
-                batch_size = batch_size,
-                paged = True
-            )
-
-            self.block_index = block_index
-            self.cache_seqlens = cache_seqlens
-            self.max_cache_seqlen = max_cache_seqlen
-            self.page_size = page_size
-
-            self.is_sequential = False
-            assert self.block_index.device.type == "cpu"
-            assert self.cache_seqlens.device.type == "cpu"
-            assert q_len > 0
-            if self.block_index.shape[0] == 1:
-                vi0 = self.cache_seqlens[0].item()
-                vi1 = vi0 + q_len
-                vp0 = vi0 // page_size
-                vp1 = (vi1 - 1) // page_size
-                for i in range(vp0 + 1, vp1 + 1):
-                    if self.block_index[0, i].item() != self.block_index[0, i - 1].item() + 1:
-                        break
-                else:
-                    self.is_sequential = True
-                    self.first_index = self.block_index[0, vp0].item() * page_size + vi0 - vp0 * page_size
-                    self.cache_seqlens_after = self.cache_seqlens + q_len
-
-        def get_attn_mask(self, device):
-            raise NotImplementedError()
-
-        def get_block_index(self, device) -> torch.Tensor:
-            if self.block_index.device != device:
-                self.block_index = safe_move_tensor(self.block_index, device)
-            return self.block_index
-
-        def get_cache_seqlens(self, device_idx: int) -> torch.Tensor:
-            if self.cache_seqlens.device.index != device_idx:
-                self.cache_seqlens = safe_move_tensor(self.cache_seqlens, device_idx, non_blocking = True)
-            return self.cache_seqlens
-
-        def get_cache_seqlens_after(self, device_idx: int) -> torch.Tensor:
-            if self.cache_seqlens_after.device.index != device_idx:
-                self.cache_seqlens_after = safe_move_tensor(self.cache_seqlens_after, device_idx, non_blocking = True)
-            return self.cache_seqlens_after
-
+    from exllamav2.attn_params import Params
+    from exllamav2.attn_params import PagedParams
 
     def __init__(self,
                  model: ExLlamaV2,
@@ -298,6 +139,8 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         super().__init__(model, key)
 
         cfg = self.model.config
+        self.is_tp = False
+        self.tp_dq_size = None
 
         self.layer_idx = layer_idx
         self.has_norm = has_norm
@@ -372,16 +215,16 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
 
     @torch.inference_mode
-    def load(self):
+    def load(self, device_context: bool = True):
 
         cfg = self.model.config
 
         if self.pre_layernorm is not None: self.pre_layernorm.load()
         if self.post_layernorm is not None: self.post_layernorm.load()
-        self.q_proj.load()
-        self.k_proj.load()
-        self.v_proj.load()
-        self.o_proj.load()
+        self.q_proj.load(device_context = device_context)
+        self.k_proj.load(device_context = device_context)
+        self.v_proj.load(device_context = device_context)
+        self.o_proj.load(device_context = device_context)
         if self.q_norm is not None: self.q_norm.load()
         if self.k_norm is not None: self.k_norm.load()
 
@@ -389,14 +232,18 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
             assert self.k_proj.is_quant() and self.v_proj.is_quant() and self.o_proj.is_quant(), "Partially quantized attention layer"
 
-            device_tensors = self.model.get_device_tensors(self.device_idx)
-            device_tensors.begin_scratch_alloc()
-            self.temp_state = device_tensors.get_scratch_slice(self.temp_state_size())
-            # self.temp_q = device_tensors.get_scratch_slice(self.temp_q_size())
-            # self.temp_k = device_tensors.get_scratch_slice(self.temp_k_size())
-            # self.temp_v = device_tensors.get_scratch_slice(self.temp_v_size())
-            self.temp_dq = device_tensors.get_scratch_slice(self.temp_dq_size())
-            # self.temp_kv = device_tensors.get_scratch_slice(self.temp_kv_size()) if cfg.num_attention_heads != cfg.num_key_value_heads else None
+            if device_context:
+                device_context = self.model.get_device_context(self.device_idx)
+                device_context.begin_scratch_alloc()
+                self.temp_state = device_context.get_scratch_slice(self.temp_state_size())
+                # self.temp_q = device_context.get_scratch_slice(self.temp_q_size())
+                # self.temp_k = device_context.get_scratch_slice(self.temp_k_size())
+                # self.temp_v = device_context.get_scratch_slice(self.temp_v_size())
+                self.temp_dq = device_context.get_scratch_slice(self.temp_dq_size())
+                # self.temp_kv = device_context.get_scratch_slice(self.temp_kv_size()) if cfg.num_attention_heads != cfg.num_key_value_heads else None
+            else:
+                self.temp_state = none_tensor
+                self.temp_dq = none_tensor
 
             if self.has_norm:
                 norm_weight = self.pre_layernorm.weight if self.pre_layernorm.weight is not None else none_tensor
@@ -452,7 +299,8 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 k_norm,
                 post_norm_weight,
                 post_norm_bias,
-                cfg.arch.residual_stream_fp32
+                cfg.arch.residual_stream_fp32,
+                not cfg.no_graphs
             )
 
 
@@ -565,7 +413,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         return 2 * att_max * cfg.num_attention_heads * 2 + 128
 
 
-    def set_device_idx(self, idx):
+    def set_device_idx(self, idx: int | None):
         super().set_device_idx(idx)
 
         if self.pre_layernorm is not None: self.pre_layernorm.set_device_idx(idx)
@@ -589,16 +437,27 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
 
     # @profile
-    def forward_paged(self,
-                      hidden_states: torch.Tensor,
-                      cache: ExLlamaV2CacheBase | None = None,
-                      attn_params: ExLlamaV2Attention.PagedParams | None = None,
-                      loras: list[ExLlamaV2Lora] | None = None,
-                      **kwargs) -> torch.Tensor:
+    def forward_paged(
+        self,
+        hidden_states: torch.Tensor,
+        cache: ExLlamaV2CacheBase | None = None,
+        attn_params: ExLlamaV2Attention.PagedParams | None = None,
+        loras: list[ExLlamaV2Lora] | None = None,
+        **kwargs
+    ) -> torch.Tensor:
+
+        if self.is_tp:
+            return self.forward_paged_tp(
+                hidden_states,
+                cache,
+                attn_params,
+                loras,
+                **kwargs,
+            )
 
         is_q = self.q_handle is not None
         cfg = self.model.config
-        constants = self.model.get_device_tensors(self.device_idx, scratch = is_q)
+        constants = self.model.get_device_context(self.device_idx, scratch = is_q)
         page_size = attn_params.page_size
         batch_size, q_len, _ = hidden_states.shape
         cache_seqlens = attn_params.get_cache_seqlens(self.device_idx)
@@ -742,6 +601,234 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         return hidden_states
 
 
+    # @profile
+    def forward_paged_tp(
+        self,
+        hidden_states: torch.Tensor,
+        cache: ExLlamaV2CacheBase | None = None,
+        attn_params: ExLlamaV2Attention.PagedParams | None = None,
+        loras: list[ExLlamaV2Lora] | None = None,
+        **kwargs
+    ) -> torch.Tensor:
+
+        cfg = self.model.config
+        ctx = self.model.tp_context
+
+        assert not self.sliding_window, \
+            "Sliding window not supported in TP mode"
+
+        attn_params.prep_tp(self.model)
+        page_size = attn_params.page_size
+
+        batch_size, q_len, _ = hidden_states.shape
+        rows = batch_size * q_len
+        hidden_states = hidden_states.view(-1, cfg.hidden_size)
+        dtype = hidden_states.dtype
+
+        k_cache_f, v_cache_f = cache.get_kv_state(
+            self.layer_idx,
+            batch_size,
+            0,
+            attn_params.max_cache_seqlen,
+            page_size,
+            attn_params.cache_seqlens_tp,
+            attn_params.block_index_tp
+        )
+
+        k_cache = [x.view(x.shape[1] // page_size, page_size, x.shape[2], x.shape[3]) for x in k_cache_f]
+        v_cache = [x.view(x.shape[1] // page_size, page_size, x.shape[2], x.shape[3]) for x in v_cache_f]
+
+        sin, cos = ctx.get_sin_cos()
+
+        ext_c.tp_attn_forward_paged_(
+            self.model.tp_context.ext_tp_context,
+            hidden_states,
+            self.temp_bc0,
+            self.temp_bc1,
+            self.temp_bc2,
+            self.temp_q,
+            self.temp_k,
+            self.temp_v,
+            self.temp_o,
+            k_cache,
+            v_cache,
+            self.pre_layernorm.weight if self.pre_layernorm is not None else [],
+            self.pre_layernorm.variance_epsilon if self.pre_layernorm is not None else 0.0,
+            self.q_proj.q_handle,
+            self.k_proj.q_handle,
+            self.v_proj.q_handle,
+            self.o_proj.q_handle,
+            cfg.head_dim,
+            int(cfg.arch.rope_style),
+            batch_size,
+            q_len,
+            sin,
+            cos,
+            attn_params.cache_seqlens_tp,
+            attn_params.block_index_tp,
+            self.scaling
+        )
+
+        cache.store_kv_state(
+            self.layer_idx,
+            batch_size,
+            0,
+            q_len,
+            page_size,
+            attn_params.cache_seqlens_tp,
+            attn_params.block_index_tp
+        )
+
+        return ctx.get_pinned(0, batch_size, q_len, cfg.hidden_size)
+
+
+    # @profile
+    def forward_paged_tp_old(
+        self,
+        hidden_states: torch.Tensor,
+        cache: ExLlamaV2CacheBase | None = None,
+        attn_params: ExLlamaV2Attention.PagedParams | None = None,
+        loras: list[ExLlamaV2Lora] | None = None,
+        **kwargs
+    ) -> torch.Tensor:
+
+        assert self.q_handle is not None
+        cfg = self.model.config
+        split = self.model.tp_context.get_split(BROADCAST_KV)
+        batch_size, q_len, _ = hidden_states.shape
+        attn_params.prep_tp(self.model)
+        page_size = attn_params.page_size
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+        k_cache_f, v_cache_f = cache.get_kv_state(
+            self.layer_idx,
+            batch_size,
+            0,
+            attn_params.max_cache_seqlen,
+            page_size,
+            attn_params.cache_seqlens_tp,
+            attn_params.block_index_tp
+        )
+
+        k_cache = [x.view(x.shape[1] // page_size, page_size, x.shape[2], x.shape[3]) for x in k_cache_f]
+        v_cache = [x.view(x.shape[1] // page_size, page_size, x.shape[2], x.shape[3]) for x in v_cache_f]
+
+        hidden_states = self.model.tp_context.broadcast(0, hidden_states, BROADCAST_KV, dim = cfg.head_dim)
+
+        residual = hidden_states
+
+        post_norm = self.pre_layernorm.forward_tp(hidden_states, output_split = True) if self.has_norm else hidden_states
+        q = self.q_proj.forward_tp(post_norm, loras = loras, output_split = True, dim = cfg.head_dim)
+        k = self.k_proj.forward_tp(post_norm, loras = loras, output_split = True, dim = cfg.head_dim)
+        v = self.v_proj.forward_tp(post_norm, loras = loras, output_split = True, dim = cfg.head_dim)
+        q = [q_.view(batch_size, q_len, q_.shape[1] // cfg.head_dim, cfg.head_dim) for q_ in q]
+        k = [k_.view(batch_size, q_len, k_.shape[1] // cfg.head_dim, cfg.head_dim) for k_ in k]
+        v = [v_.view(batch_size, q_len, v_.shape[1] // cfg.head_dim, cfg.head_dim) for v_ in v]
+        if cfg.use_qk_norm:
+            assert False, "TP not implemented for QK norm"  # TODO: ...
+            # q = self.q_norm.forward(q)
+            # k = self.k_norm.forward(k)
+        if cfg.arch.rope_style != RopeStyle.NONE:
+            for idx, (dev, a, b) in enumerate(split):
+                context = self.model.get_device_context(dev)
+                torch.cuda.set_stream(context.stream)
+                for t, heads in [(q[idx], cfg.num_key_value_groups), (k[idx], 1)]:
+                    ext_c.rope_(
+                        t,
+                        context.sin,
+                        context.cos,
+                        0,
+                        (b - a) * heads,
+                        cfg.head_dim,
+                        attn_params.cache_seqlens_tp[idx],
+                        cfg.arch.rope_style == RopeStyle.NEOX
+                    )
+        if attn_params.is_sequential:
+            k_ = [x[:, attn_params.first_index: attn_params.first_index + q_len, :, :] for x in k_cache_f]
+            v_ = [x[:, attn_params.first_index: attn_params.first_index + q_len, :, :] for x in v_cache_f]
+            for (dev, a, b), x_, x, y_, y in zip(split, k_, k, v_, v):
+                context = self.model.get_device_context(dev)
+                torch.cuda.set_stream(context.stream)
+                x_.copy_(x)
+                y_.copy_(y)
+            k = None
+            v = None
+            cache_seqlens_a = attn_params.cache_seqlens_after_tp
+        else:
+            cache_seqlens_a = attn_params.cache_seqlens_tp
+
+        # if cache.q_block == 1:
+        #     cache.get_kv_state(
+        #         self.layer_idx,
+        #         batch_size,
+        #         0,
+        #         attn_params.max_cache_seqlen,
+        #         page_size,
+        #         attn_params.cache_seqlens_tp,
+        #         attn_params.block_index_tp
+        #     )
+
+        flash_kwargs = {}
+        if self.sliding_window:
+            # assert has_flash_attn_with_window, \
+            #     "Installed version of flash-attn does not support sliding window"
+            if has_flash_attn_with_window:
+                flash_kwargs["window_size"] = (self.sliding_window, self.sliding_window)
+        if cfg.attn_logit_softcapping:
+            # assert has_flash_attn_with_softcap, \
+            #     "Installed version of flash-attn does not support softcapping"
+            if has_flash_attn_with_softcap:
+                flash_kwargs["softcap"] = cfg.attn_logit_softcapping
+
+        attn_outputs = []
+        for idx in range(len(split)):
+            dev, a, b = split[idx]
+            context = self.model.get_device_context(dev)
+            torch.cuda.set_stream(context.stream)
+
+            attn_output = flash_attn_with_kvcache(
+                q = q[idx],
+                k = k[idx] if k is not None else None,
+                v = v[idx] if v is not None else None,
+                k_cache = k_cache[idx],
+                v_cache = v_cache[idx],
+                cache_seqlens = cache_seqlens_a[idx],
+                block_table = attn_params.block_index_tp[idx],
+                causal = True,
+                softmax_scale = self.scaling,
+                **flash_kwargs
+            )
+            attn_output = attn_output.view(batch_size * q_len, (b - a) * cfg.head_dim * cfg.num_key_value_groups)
+            attn_outputs.append(attn_output)
+
+        cache.store_kv_state(
+            self.layer_idx,
+            batch_size,
+            0,
+            q_len,
+            page_size,
+            attn_params.cache_seqlens_tp,
+            attn_params.block_index_tp
+        )
+
+        # Output projection
+
+        attn_outputs = self.model.tp_context.allgather(1, attn_outputs, BROADCAST_Q, BROADCAST_Q, dim = cfg.head_dim)
+
+        hidden_states = self.o_proj.forward_tp(attn_outputs, loras = loras, dim = cfg.head_dim, output_split = True)
+
+        if self.has_residual:
+            self.model.tp_context.add_residual(hidden_states, residual, BROADCAST_Q, dim = cfg.head_dim)
+
+        hidden_states = self.model.tp_context.gather(0, hidden_states, BROADCAST_Q, dim = cfg.head_dim)
+
+        # if self.post_layernorm:  # TODO: ...
+        #     hidden_states = self.post_layernorm.forward(hidden_states)
+
+        hidden_states = hidden_states.view(batch_size, q_len, hidden_states.shape[-1])
+        return hidden_states
+
+
     def _attn_torch(self, batch_size, q_len, q_states, k_states, v_states, attn_params, cfg):
 
         q_states = q_states.transpose(1, 2)
@@ -880,6 +967,30 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 **kwargs
             )
 
+        if self.is_tp:
+            if cache is not None:
+                return self.forward_tp(
+                    hidden_states,
+                    cache,
+                    attn_params,
+                    past_len,
+                    intermediates,
+                    loras,
+                    **kwargs,
+                )
+            else:
+                # TODO: Can't use the optimized forward function because it writes directly to a fixed output
+                #   tensor, and flash-attn currently has a bug that prevents that from working when q_len == 1
+                return self.forward_tp_old(
+                    hidden_states,
+                    cache,
+                    attn_params,
+                    past_len,
+                    intermediates,
+                    loras,
+                    **kwargs,
+                )
+
         if self.q_handle is None or intermediates:
             return self.forward_torch(
                 hidden_states,
@@ -892,7 +1003,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             )
 
         cfg = self.model.config
-        constants = self.model.get_device_tensors(self.device_idx)
+        constants = self.model.get_device_context(self.device_idx)
 
         batch_size, q_len, _ = hidden_states.shape
         direct = (batch_size == 1 and cache is not None and isinstance(cache, ExLlamaV2CacheBase))
@@ -1000,6 +1111,173 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
         return hidden_states
 
+    def forward_tp(
+        self,
+        hidden_states: torch.Tensor,
+        cache: ExLlamaV2CacheBase | None = None,
+        attn_params: ExLlamaV2Attention.Params | None = None,
+        past_len: int | None = None,
+        intermediates: bool = False,
+        loras: list[ExLlamaV2Lora] | None = None,
+        **kwargs
+    ) -> torch.Tensor:
+
+        cfg = self.model.config
+        ctx = self.model.tp_context
+
+        assert not cache or cache.q_block != 1, \
+            "Models with odd key/value dims not supported in TP mode with quantized cache"
+        assert not self.sliding_window, \
+            "Sliding window not supported in TP mode"
+
+        attn_params.prep_tp(self.model)
+
+        batch_size, q_len, _ = hidden_states.shape
+        hidden_states = hidden_states.view(-1, cfg.hidden_size)
+        past_len = 0 if cache is None else cache.current_seq_len
+
+        k_cache, v_cache = cache.get_kv_state(self.layer_idx, batch_size, 0, past_len) if cache else ([], [])
+
+        sin, cos = ctx.get_sin_cos()
+
+        ext_c.tp_attn_forward_(
+            self.model.tp_context.ext_tp_context,
+            hidden_states,
+            self.temp_bc0,
+            self.temp_bc1,
+            self.temp_bc2,
+            self.temp_q,
+            self.temp_k,
+            self.temp_v,
+            self.temp_o,
+            k_cache,
+            v_cache,
+            self.pre_layernorm.weight if self.pre_layernorm is not None else [],
+            self.pre_layernorm.variance_epsilon if self.pre_layernorm is not None else 0.0,
+            self.q_proj.q_handle,
+            self.k_proj.q_handle,
+            self.v_proj.q_handle,
+            self.o_proj.q_handle,
+            cfg.head_dim,
+            int(cfg.arch.rope_style),
+            batch_size,
+            q_len,
+            sin,
+            cos,
+            attn_params.past_len_tp,
+            self.scaling
+        )
+
+        if cache is not None:
+            cache.store_kv_state(self.layer_idx, batch_size, past_len, q_len)
+
+        return ctx.get_pinned(0, batch_size, q_len, cfg.hidden_size)
+
+
+    def forward_tp_old(
+        self,
+        hidden_states: torch.Tensor,
+        cache: ExLlamaV2CacheBase | None = None,
+        attn_params: ExLlamaV2Attention.Params | None = None,
+        past_len: int | None = None,
+        intermediates: bool = False,
+        loras: list[ExLlamaV2Lora] | None = None,
+        **kwargs
+   ):
+        cfg = self.model.config
+        split = self.model.tp_context.get_split(BROADCAST_KV)
+        batch_size, q_len, _ = hidden_states.shape
+        attn_params.prep_tp(self.model)
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        past_len = 0 if cache is None else cache.current_seq_len
+
+        assert self.q_handle is not None
+        use_flash_attn = has_flash_attn and not cfg.no_flash_attn
+        assert use_flash_attn, "Tensor parallel inference requires flash-attn"
+
+        hidden_states = self.model.tp_context.broadcast(0, hidden_states, BROADCAST_KV, dim = cfg.head_dim)
+
+        residual = hidden_states
+
+        post_norm = self.pre_layernorm.forward(hidden_states) if self.has_norm else hidden_states
+        q = self.q_proj.forward_tp(post_norm, loras = loras, output_split = True, dim = cfg.head_dim)
+        k = self.k_proj.forward_tp(post_norm, loras = loras, output_split = True, dim = cfg.head_dim)
+        v = self.v_proj.forward_tp(post_norm, loras = loras, output_split = True, dim = cfg.head_dim)
+
+        q = [q_.view(batch_size, q_len, q_.shape[1] // cfg.head_dim, cfg.head_dim) for q_ in q]
+        k = [k_.view(batch_size, q_len, k_.shape[1] // cfg.head_dim, cfg.head_dim) for k_ in k]
+        v = [v_.view(batch_size, q_len, v_.shape[1] // cfg.head_dim, cfg.head_dim) for v_ in v]
+
+        if cache:
+            k_cache, v_cache = cache.get_kv_state(self.layer_idx, batch_size, 0, past_len)
+        else:
+            k_cache, v_cache = None, None
+
+        if cfg.arch.rope_style != RopeStyle.NONE:
+            for idx, (dev, a, b) in enumerate(split):
+                context = self.model.get_device_context(dev)
+                torch.cuda.set_stream(context.stream)
+                for t, heads in [(q[idx], cfg.num_key_value_groups), (k[idx], 1)]:
+                    ext_c.rope_(
+                        t,
+                        context.sin,
+                        context.cos,
+                        past_len,
+                        (b - a) * heads,
+                        cfg.head_dim,
+                        attn_params.position_offsets_tp[idx] if attn_params.position_offsets is not None else none_tensor,
+                        cfg.arch.rope_style == RopeStyle.NEOX
+                    )
+
+        attn_outputs = []
+        for idx in range(len(split)):
+            dev, a, b = split[idx]
+            context = self.model.get_device_context(dev)
+            torch.cuda.set_stream(context.stream)
+
+            if k_cache is not None:
+                attn_output = flash_attn_with_kvcache(
+                    q = q[idx],
+                    k = k[idx],
+                    v = v[idx],
+                    k_cache = k_cache[idx],
+                    v_cache = v_cache[idx],
+                    causal = True,
+                    softmax_scale = self.scaling,
+                    cache_seqlens = attn_params.past_len_tp[idx]
+                )
+            else:
+                attn_output = flash_attn_func(
+                    q[idx],
+                    k[idx],
+                    v[idx],
+                    causal = True,
+                    softmax_scale=self.scaling,
+                )
+
+            attn_output = attn_output.view(batch_size * q_len, (b - a) * cfg.head_dim * cfg.num_key_value_groups)
+            attn_outputs.append(attn_output)
+
+        if cache is not None:
+            cache.store_kv_state(self.layer_idx, batch_size, past_len, q_len)
+
+        # Output projection
+
+        attn_outputs = self.model.tp_context.allgather(1, attn_outputs, BROADCAST_Q, BROADCAST_Q, dim = cfg.head_dim)
+
+        hidden_states = self.o_proj.forward_tp(attn_outputs, loras = loras, dim = cfg.head_dim, output_split = True)
+
+        if self.has_residual:
+            self.model.tp_context.add_residual(hidden_states, residual, BROADCAST_Q, dim = cfg.head_dim)
+
+        hidden_states = self.model.tp_context.gather(0, hidden_states, BROADCAST_Q, dim = cfg.head_dim)
+
+        # if self.post_layernorm:  # TODO: ...
+        #     hidden_states = self.post_layernorm.forward(hidden_states)
+
+        hidden_states = hidden_states.view(batch_size, q_len, hidden_states.shape[-1])
+        return hidden_states
+
 
     def forward_torch(self,
                       hidden_states: torch.Tensor,
@@ -1046,7 +1324,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
         # Apply position embeddings
 
-        constants = self.model.get_device_tensors(self.device_idx, scratch = False)
+        constants = self.model.get_device_context(self.device_idx, scratch = False)
 
         if attn_params.position_offsets is not None:
             position_offsets = attn_params.get_position_offsets(hidden_states.device)
@@ -1150,3 +1428,68 @@ class ExLlamaV2Attention(ExLlamaV2Module):
     def is_quant(self):
         return self.q_handle is not None
 
+
+    def tp_split(self):
+
+        cfg = self.model.config
+        ctx = self.model.tp_context
+
+        if self.pre_layernorm is not None:
+            self.pre_layernorm.tp_split(BROADCAST_KV)
+        if self.post_layernorm is not None:
+            self.post_layernorm.tp_split(BROADCAST_KV)
+
+        self.q_proj.tp_split(BROADCAST_Q, dim = cfg.head_dim)
+        self.k_proj.tp_split(BROADCAST_KV, dim = cfg.head_dim)
+        self.v_proj.tp_split(BROADCAST_KV, dim = cfg.head_dim)
+        self.o_proj.tp_split(BROADCAST_Q, dim = cfg.head_dim)
+
+        maxrows = cfg.max_batch_size * cfg.max_input_len
+        dtype = torch.half
+
+        ctx.begin_scratch_alloc_tp()
+        ctx.reserve_scratch(self.tp_dq_size)
+        self.temp_bc0 = ctx.get_scratch_slice_tp_bc(maxrows, dtype, BROADCAST_Q, dim = cfg.head_dim)
+        self.temp_bc1 = ctx.get_scratch_slice_tp_bc(maxrows, dtype, BROADCAST_Q, dim = cfg.head_dim)
+        self.temp_bc2 = ctx.get_scratch_slice_tp_bc(maxrows, dtype, BROADCAST_Q, dim = cfg.head_dim)
+        self.temp_q = ctx.get_scratch_slice_tp(maxrows, dtype, BROADCAST_Q, dim = cfg.head_dim)
+        self.temp_k = ctx.get_scratch_slice_tp(maxrows, dtype, BROADCAST_KV, dim = cfg.head_dim)
+        self.temp_v = ctx.get_scratch_slice_tp(maxrows, dtype, BROADCAST_KV, dim = cfg.head_dim)
+        self.temp_o = ctx.get_scratch_slice_tp(maxrows, dtype, BROADCAST_Q, dim = cfg.head_dim)
+
+        self.is_tp = True
+        self.set_device_idx(None)
+
+
+    def scratch_space_tp(self):
+
+        cfg = self.model.config
+        ctx = self.model.tp_context
+        devs = ctx.num_devices
+        scratch = [0] * devs
+
+        def add(res: list[int]):
+            for i, s in enumerate(res):
+                scratch[i] += s
+
+        def amax(res: list[int]):
+            for i, s in enumerate(res):
+                scratch[i] = max(scratch[i], s)
+
+        amax(self.q_proj.scratch_space_tp(BROADCAST_Q, cfg.head_dim))
+        amax(self.k_proj.scratch_space_tp(BROADCAST_KV, cfg.head_dim))
+        amax(self.v_proj.scratch_space_tp(BROADCAST_KV, cfg.head_dim))
+        amax(self.o_proj.scratch_space_tp(BROADCAST_Q, cfg.head_dim))
+        self.tp_dq_size = [s for s in scratch]
+
+        maxrows = cfg.max_batch_size * cfg.max_input_len
+
+        add(ctx.get_temp_tensors_bc_s(maxrows, 2, BROADCAST_Q, dim = cfg.head_dim))
+        add(ctx.get_temp_tensors_bc_s(maxrows, 2, BROADCAST_Q, dim = cfg.head_dim))
+        add(ctx.get_temp_tensors_bc_s(maxrows, 2, BROADCAST_Q, dim = cfg.head_dim))
+        add(ctx.get_temp_tensors_s(maxrows, 2, BROADCAST_Q, dim = cfg.head_dim))
+        add(ctx.get_temp_tensors_s(maxrows, 2, BROADCAST_KV, dim = cfg.head_dim))
+        add(ctx.get_temp_tensors_s(maxrows, 2, BROADCAST_KV, dim = cfg.head_dim))
+        add(ctx.get_temp_tensors_s(maxrows, 2, BROADCAST_Q, dim = cfg.head_dim))
+
+        return scratch

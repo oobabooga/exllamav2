@@ -47,6 +47,8 @@ from exllamav2.embedding import ExLlamaV2Embedding
 from exllamav2.pos_embedding import ExLlamaV2PosEmbedding
 from exllamav2.compat import safe_move_tensor
 from exllamav2.fasttensors import cleanup_stfiles
+from exllamav2.device import ExLlamaV2DeviceContext
+from exllamav2.tensor_p import TPContext, BROADCAST_VC
 import gc
 import threading
 from typing import Callable
@@ -61,193 +63,28 @@ def _torch_device(idx):
     return f"cuda:{idx}"
 
 
-class ExLlamaV2DeviceTensors:
-
-    model: ExLlamaV2
-    device_idx: int
-    ready: bool
-
-    scratch_bytes: int
-    scratch_idx: int
-
-    sin: torch.Tensor | None
-    cos: torch.Tensor | None
-
-    scratch: torch.Tensor | None
-
-
-    def __init__(self,
-                 model: ExLlamaV2,
-                 device_idx: int,
-                 scratch_bytes: int):
-
-        self.model = model
-        self.device_idx = device_idx
-        self.ready = False
-        self.scratch = None
-        self.scratch_bytes = scratch_bytes
-        self.scratch_idx = 0
-
-
-    def prepare(self, scratch):
-
-        self.prepare_sincos()
-
-        if scratch:
-            self.scratch = torch.empty((self.scratch_bytes // 2,), dtype = torch.half, device = _torch_device(self.device_idx))
-
-        self.ready = True
-
-
-    def drop(self):
-
-        self.scratch = None
-        self.sin = None
-        self.cos = None
-        self.ready = False
-
-
-    def free(self):
-
-        self.drop()
-        self.scratch_bytes = 1
-
-
-    def begin_scratch_alloc(self):
-
-        self.scratch_idx = 0
-
-
-    def get_scratch_slice(self, size_bytes):
-
-        if self.scratch is None: self.prepare(True)
-
-        size_bytes = ((size_bytes + 127) // 128) * 128
-        size_half = size_bytes // 2
-        scratch_slice = self.scratch.narrow(0, self.scratch_idx, size_half)
-        self.scratch_idx += size_half
-        return scratch_slice
-
-
-    @staticmethod
-    def _apply_scaling(
-        freqs: torch.Tensor,
-        scale_factor: float = 8,
-        low_freq_factor: float = 1,
-        high_freq_factor: float = 4,
-        old_context_len: int = 8192,  # original llama3 length
-    ):
-        low_freq_wavelen = old_context_len / low_freq_factor
-        high_freq_wavelen = old_context_len / high_freq_factor
-        new_freqs = []
-
-        for freq in freqs:
-            wavelen = 2 * math.pi / freq
-            if wavelen < high_freq_wavelen:
-                new_freqs.append(freq)
-            elif wavelen > low_freq_wavelen:
-                new_freqs.append(freq / scale_factor)
-            else:
-                assert low_freq_wavelen != high_freq_wavelen
-                smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
-                new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
-        return torch.tensor(new_freqs, dtype = freqs.dtype, device = freqs.device)
-
-
-    def prepare_sincos(self):
-
-        device = _torch_device(self.device_idx)
-
-        cfg = self.model.config
-        if cfg.arch.rope_style == RopeStyle.NONE:
-            self.sin = torch.zeros((1,), device = device, dtype = torch.half)
-            self.cos = self.sin
-            return
-
-        base = cfg.rotary_embedding_base
-        alpha = cfg.scale_alpha_value or 1.0
-        scale = cfg.scale_pos_emb or 1.0
-        head_dim = cfg.head_dim
-        scaling_factor = 1.0
-
-        # Alpha scaling for any rope_scaling type
-
-        if alpha != 1.0: base *= alpha ** (cfg.head_dim / (cfg.head_dim - 2))
-
-        # "su"
-
-        if cfg.alt_rope_method == "su":
-
-            a = cfg.max_seq_len
-            b = cfg.original_max_seq_len
-            if a > b:
-                ext_factors = torch.tensor(cfg.scale_long_factor, dtype = torch.float32, device = device)
-                scaling_factor = math.sqrt(1 + math.log(a / b) / math.log(b))
-            else:
-                ext_factors = torch.tensor(cfg.scale_short_factor, dtype = torch.float32, device = device)
-
-            inv_freq = 1.0 / (ext_factors * base ** (torch.arange(0, head_dim, 2, device = device).float() / head_dim))
-
-        # Llama 3.1
-
-        elif cfg.alt_rope_method == "llama3":
-
-            inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device = device).float() / head_dim))
-            inv_freq = self._apply_scaling(
-                inv_freq,
-                cfg.l3_rope_factor,
-                cfg.l3_rope_low_freq_factor,
-                cfg.l3_rope_high_freq_factor,
-                cfg.l3_rope_original_max_position_embeddings,
-            )
-
-        # Regular
-
-        else:
-
-            inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device = device).float() / head_dim))
-
-        # Common
-
-        t = torch.arange(cfg.max_seq_len, device = device, dtype = torch.float32)
-        if scale != 1.0: t /= scale
-
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        if cfg.arch.rope_style == RopeStyle.NEOX:
-            emb = torch.cat((freqs, freqs), dim=-1)
-        elif cfg.arch.rope_style == RopeStyle.GPTJ:
-            emb = torch.repeat_interleave(freqs, 2, dim=-1)
-        else:
-            raise ValueError()
-
-        self.sin = emb.sin()[None, None, :, :]
-        self.cos = emb.cos()[None, None, :, :]
-        if scaling_factor != 1.0:
-            self.sin *= scaling_factor
-            self.cos *= scaling_factor
-        self.sin = self.sin.half()
-        self.cos = self.cos.half()
-
-
 class ExLlamaV2:
 
     config: ExLlamaV2Config
     modules: list[ExLlamaV2Module]
     modules_dict: dict[str: ExLlamaV2Module]
-    device_tensors: list[ExLlamaV2DeviceTensors]
+    device_context: list[ExLlamaV2DeviceContext | None]
     cache_map: dict[int: str]
     last_kv_layer_idx: int
     head_layer_idx: int
     loaded: bool
+
+    tp_context: TPContext | None
 
     def __init__(self, config: ExLlamaV2Config, lazy_load = False):
 
         self.config = config
         self.modules = []
         self.modules_dict = {}
-        self.device_tensors = []
+        self.device_context = []
         self.cache_map = {}
         self.loaded = False
+        self.tp_context = None
 
         # Build model
 
@@ -382,9 +219,12 @@ class ExLlamaV2:
 
         # Prepare to prepare device tensors
 
-        self.device_tensors = []
+        self.device_context = []
         for idx, scratch_bytes in enumerate(fixed_bytes):
-            self.device_tensors.append(ExLlamaV2DeviceTensors(self, idx, scratch_bytes))
+            if scratch_bytes > 0:
+                self.device_context.append(ExLlamaV2DeviceContext(self, idx, scratch_bytes))
+            else:
+                self.device_context.append(None)
 
         # Create map for cache
 
@@ -404,6 +244,32 @@ class ExLlamaV2:
         callback_gen: Callable[[int, int], None] | None = None,
         progress: bool = False
     ):
+        """
+        Load model, regular manual split mode.
+
+        :param gpu_split:
+            List of VRAM allocations for weights and fixed buffers per GPU. Does not account for the size of the cache
+            which must be allocated with reference to the model subsequently and whose split across GPUs will depend
+            on which devices end up receiving which attention layers.
+
+            If None, only the first GPU is used.
+
+        :param lazy:
+            Only set the device map according to the split, but don't actually load any of the modules. Modules can
+            subsequently be loaded and unloaded one by one for layer-streaming mode.
+
+        :param stats:
+            Legacy, unused
+
+        :param callback:
+            Callable function that triggers after each layer has loaded, for progress update etc.
+
+        :param callback_gen:
+            Same as callback, but for use by async functions
+
+        :param progress:
+            If True, create a rich progress bar in the console while loading. Cannot be used with callbacks
+        """
 
         if progress:
             progressbar = get_basic_progress()
@@ -430,7 +296,6 @@ class ExLlamaV2:
         callback: Callable[[int, int], None] | None = None,
         callback_gen: Callable[[int, int], None] | None = None
     ):
-
         with torch.inference_mode():
 
             stats_ = self.set_device_map(gpu_split or [99999])
@@ -456,8 +321,126 @@ class ExLlamaV2:
             self.loaded = True
             cleanup_stfiles()
 
-            # if stats: yield gpu_split, stats_
-            # else: yield gpu_split
+
+    def load_tp(
+        self,
+        gpu_split: list[float] | None = None,
+        callback: Callable[[int, int], None] | None = None,
+        callback_gen: Callable[[int, int], None] | None = None,
+        progress: bool = False,
+        expect_cache_tokens: int = 0,
+        expect_cache_base: type = None
+    ):
+        """
+        Load model, tensor-parallel mode.
+
+        :param gpu_split:
+            List of VRAM allocations per GPU. The loader attempts to balance tensor splits to stay within these
+            allocations, accounting for an uneven distribution of attention heads and the expected size of the cache.
+
+            If None, the loader attempts to use all available GPUs and creates a split based on the currently available
+            VRAM according to nvidia-smi etc.
+
+        :param callback:
+            Callable function that triggers after each layer has loaded, for progress update etc.
+
+        :param callback_gen:
+            Same as callback, but for use by async functions
+
+        :param progress:
+            If True, create a rich progress bar in the console while loading. Cannot be used with callbacks
+
+        :param expect_cache_tokens:
+            Expected size of the cache, in tokens (i.e. max_seq_len * max_batch_size, or just the cache size for use
+            with the dynamic generator) to inform the automatic tensor split. If not provided, the configured
+            max_seq_len for the model is assumed.
+
+        :param expect_cache_base:
+            Cache type to expect, e.g. ExLlamaV2Cache_Q6. Also informs the tensor split. If not provided, FP16 cache
+            is assumed.
+        """
+        if progress:
+            progressbar = get_basic_progress()
+            progressbar.start()
+            task_id = progressbar.add_task("Loading: " + self.config.model_dir, total = len(self.modules))
+            module = 0
+            def callback_pb(a, b):
+                progressbar.update(task_id, advance = 1)
+            assert callback is None, \
+                "Cannot use callback function and console progress bar at the same time."
+            callback = callback_pb
+        f = self.load_tp_gen(gpu_split, callback, callback_gen, expect_cache_tokens, expect_cache_base)
+        for item in f:
+            pass
+        if progress:
+            progressbar.stop()
+
+
+    def load_tp_gen(
+        self,
+        gpu_split: list[float] | None = None,
+        callback: Callable[[int, int], None] | None = None,
+        callback_gen: Callable[[int, int], None] | None = None,
+        expect_cache_tokens: int = 0,
+        expect_cache_base: type = None
+    ):
+        self.config.no_graphs = True
+        self.tp_context = TPContext(self, gpu_split, expect_cache_tokens, expect_cache_base)
+
+        # Create device tensors
+
+        devs = self.tp_context.num_devices
+        scratch = [0] * devs
+        for module in self.modules[1:]:
+            ms = module.scratch_space_tp()
+            for i, m in enumerate(ms):
+                scratch[i] = max(scratch[i], m)
+
+        self.device_context = [None] * devs
+        for idx in range(devs):
+            if scratch[idx] > 0:
+                self.device_context[idx] = ExLlamaV2DeviceContext(self, idx, scratch[idx])
+
+        # Load module weights
+
+        with torch.inference_mode():
+
+            for idx in range(len(self.modules)):
+                module = self.modules[idx]
+
+                if callback is not None: callback(idx, len(self.modules))
+                if callback_gen is not None: yield from callback_gen(idx, len(self.modules))
+
+                if isinstance(module, ExLlamaV2Embedding):
+                    module.set_device_idx(-1)
+                else:
+                    module.set_device_idx(self.tp_context.device)
+
+                module.load(device_context = False)
+
+                if isinstance(module, ExLlamaV2Embedding):
+                    module.tp_split()
+                if isinstance(module, ExLlamaV2Attention):
+                    module.tp_split()
+                if isinstance(module, ExLlamaV2MLP):
+                    module.tp_split()
+                if isinstance(module, ExLlamaV2RMSNorm):
+                    module.tp_split(BROADCAST_VC)
+                elif isinstance(module, ExLlamaV2Linear):
+                    module.tp_split(BROADCAST_VC)
+
+                module.set_device_idx(None)
+
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            if callback is not None: callback(len(self.modules), len(self.modules))
+            if callback_gen is not None: yield from callback_gen(len(self.modules), len(self.modules))
+
+            self.loaded = True
+            cleanup_stfiles()
+
+            self.tp_context.finalize()
 
 
     def load_autosplit(
@@ -469,7 +452,31 @@ class ExLlamaV2:
         callback_gen: Callable[[int, int], None] | None = None,
         progress: bool = False
     ):
+        """
+        Load model, auto-split mode. This mode loads the model and builds the cache in parallel, using available
+        devices in turn and moving on to the next device whenever the previous one is full.
 
+        :param cache:
+            Cache constructed with lazy = True. Actual tensor allocation for the cache will happen while loading the
+            model.
+
+        :param reserve_vram:
+            Number of bytes to reserve on each device, either for all devices (as an int) or per-device (as a list).
+
+        :param last_id_only:
+            If True, model will be loaded in a mode that does can only output one set of logits (i.e. one token
+            position) per forward pass. This conserves memory if the model is only to be used for generating text and
+            not e.g. perplexity measurement.
+
+        :param callback:
+            Callable function that triggers after each layer has loaded, for progress update etc.
+
+        :param callback_gen:
+            Same as callback, but for use by async functions
+
+        :param progress:
+            If True, create a rich progress bar in the console while loading. Cannot be used with callbacks
+        """
         if progress:
             progressbar = get_basic_progress()
             progressbar.start()
@@ -506,7 +513,7 @@ class ExLlamaV2:
 
         with torch.inference_mode():
 
-            self.device_tensors = []
+            self.device_context = []
 
             # Reserved space
 
@@ -552,7 +559,7 @@ class ExLlamaV2:
 
                     if current_device > last_touched_device:
 
-                        self.device_tensors.append(ExLlamaV2DeviceTensors(self, current_device, scratch_fixed))
+                        self.device_context.append(ExLlamaV2DeviceContext(self, current_device, scratch_fixed))
                         # if attn_mask is not None:
                         #     reserved_vram_tensors.append(attn_mask)
                         #     attn_mask = safe_move_tensor(attn_mask, _torch_device(current_device))
@@ -638,13 +645,20 @@ class ExLlamaV2:
 
 
     def unload(self):
+        """
+        Unloads the model and frees all unmanaged resources.
+        """
 
         for module in self.modules:
             module.unload()
 
         self.modules = []
         self.modules_dict = {}
-        self.device_tensors = []
+        self.device_context = []
+
+        if self.tp_context:
+            self.tp_context.unload()
+            self.tp_context = None
 
 
     def set_cache_map(self):
@@ -660,31 +674,34 @@ class ExLlamaV2:
         return list(set(self.cache_map.values()))
 
 
-    def create_device_tensors(self, scratch_bytes):
+    def create_device_context(self, scratch_bytes):
 
         for idx, b in enumerate(scratch_bytes):
 
-            tensors = ExLlamaV2DeviceTensors(self, idx, b)
-            self.device_tensors.append(tensors)
+            tensors = ExLlamaV2DeviceContext(self, idx, b)
+            self.device_context.append(tensors)
 
 
-    def drop_device_tensors(self):
+    def drop_device_context(self):
 
-        for dt in self.device_tensors:
-            dt.drop()
-
-
-    def free_device_tensors(self):
-
-        for dt in self.device_tensors:
-            dt.free()
+        for dc in self.device_context:
+            dc.drop()
 
 
-    def get_device_tensors(self, device_idx, scratch = True):
+    def free_device_context(self):
 
-        tensors = self.device_tensors[device_idx]
-        if not tensors.ready: tensors.prepare(scratch)
-        return tensors
+        for dc in self.device_context:
+            dc.free()
+
+
+    def get_device_context(self, device_idx, scratch = True):
+
+        if device_idx == -1:
+            return None
+
+        context = self.device_context[device_idx]
+        if not context.ready: context.prepare(scratch)
+        return context
 
 
     def get_modules(self) -> list[ExLlamaV2Module]:
@@ -882,7 +899,7 @@ class ExLlamaV2:
     # @profile
     def forward_chunk(self,
                       input_ids: torch.Tensor,
-                      cache: ExLlamaV2CacheBase | list[ExLlamaV2CacheBase] | None = None,
+                      cache: ExLlamaV2CacheBase | None = None,
                       input_mask: torch.Tensor | None = None,
                       preprocess_only: bool = False,
                       last_id_only: bool = False,
@@ -898,10 +915,7 @@ class ExLlamaV2:
         batch_size, seq_len = input_ids.shape
         past_len = 0
         if cache is not None:
-            if isinstance(cache, ExLlamaV2CacheBase):
-                past_len = cache.current_seq_len
-            # else:
-            #     past_len = [c.current_seq_len for c in cache]
+            past_len = cache.current_seq_len
 
         assert self.config.max_output_len is None or \
             preprocess_only or \
@@ -930,6 +944,11 @@ class ExLlamaV2:
                 cache.current_seq_len = past_len
 
         device = self.modules[0].device_idx
+        if device is not None and device >= 0:
+            context = self.get_device_context(device)
+            if context:
+                torch.cuda.set_stream(context.stream)
+
         for idx, module in enumerate(self.modules):
 
             if idx == self.head_layer_idx and last_id_only:
@@ -947,10 +966,12 @@ class ExLlamaV2:
 
             # Onward
 
-            n_device = _torch_device(module.device_idx)
-            if n_device != device:
+            n_device = module.device_idx
+            if n_device is not None and n_device != device and n_device >= 0:
                 x = safe_move_tensor(x, n_device, non_blocking = True)
                 device = n_device
+                context = self.get_device_context(device)
+                torch.cuda.set_stream(context.stream)
 
             x = module.forward(x, cache = cache, attn_params = attn_params, past_len = past_len, loras = loras, **kwargs)
 
@@ -961,10 +982,12 @@ class ExLlamaV2:
         # Advance cache
 
         if cache is not None:
-            if isinstance(cache, list):
-                for c in cache: c.current_seq_len += seq_len
-            else:
-                cache.current_seq_len += seq_len
+            cache.current_seq_len += seq_len
+
+        # Final sync if gathering logits
+
+        if self.tp_context:
+            self.tp_context.wait_streams()
 
         # Apply logit scale
 

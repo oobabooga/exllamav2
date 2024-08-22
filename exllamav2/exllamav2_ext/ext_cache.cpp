@@ -20,6 +20,7 @@ void fp16_to_fp8(torch::Tensor in_tensor, torch::Tensor out_tensor, int batch_si
     TORCH_CHECK_DTYPE(in_tensor, kHalf);
     TORCH_CHECK_DTYPE(out_tensor, kUInt8);
     const at::cuda::OptionalCUDAGuard device_guard(device_of(in_tensor));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_SHAPES(in_tensor, 0, out_tensor, 0, 1);
     TORCH_CHECK_SHAPES(in_tensor, 1, out_tensor, 1, 1);
@@ -35,6 +36,7 @@ void fp16_to_fp8(torch::Tensor in_tensor, torch::Tensor out_tensor, int batch_si
 
     array_fp16_to_fp8_cuda
     (
+        stream,
         (const half*) in_tensor.data_ptr(),
         (unsigned char*) out_tensor.data_ptr(),
         stride,
@@ -49,6 +51,7 @@ void fp8_to_fp16(torch::Tensor in_tensor, torch::Tensor out_tensor, int batch_si
     TORCH_CHECK_DTYPE(in_tensor, kUInt8);
     TORCH_CHECK_DTYPE(out_tensor, kHalf);
     const at::cuda::OptionalCUDAGuard device_guard(device_of(in_tensor));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_SHAPES(in_tensor, 0, out_tensor, 0, 1);
     TORCH_CHECK_SHAPES(in_tensor, 1, out_tensor, 1, 1);
@@ -64,6 +67,7 @@ void fp8_to_fp16(torch::Tensor in_tensor, torch::Tensor out_tensor, int batch_si
 
     array_fp8_to_fp16_cuda
     (
+        stream,
         (const unsigned char*) in_tensor.data_ptr(),
         (half*) out_tensor.data_ptr(),
         stride,
@@ -95,6 +99,7 @@ void fp16_to_q_kv
     TORCH_CHECK_DTYPE(k_in, kHalf);
     TORCH_CHECK_DTYPE(k_out, kUInt8);
     const at::cuda::OptionalCUDAGuard device_guard(device_of(k_in));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_SHAPES(k_in, 0, k_out, 0, 1);
     TORCH_CHECK_SHAPES(k_in, 1, k_out, 1, 1);
@@ -126,6 +131,7 @@ void fp16_to_q_kv
 
         array_fp16_to_q_kv_paged_cuda
         (
+            stream,
             (const half*) k_in.data_ptr(),
             (unsigned char*) k_out.data_ptr(),
             (half*) k_scales.data_ptr(),
@@ -149,19 +155,25 @@ void fp16_to_q_kv
         int stride = k_in.size(1) * k_in.size(2) * k_in.size(3);
         int height = batch_size;
 
-        int tsize = k_in.size(2) * k_in.size(3);
-        offset *= tsize;
-        width *= tsize;
+        int dim = k_in.size(2) * k_in.size(3);
+        if (dim % Q_CACHE_BLOCKSIZE_Q)
+        {
+            while ((offset * dim) % Q_CACHE_BLOCKSIZE_Q) offset--;
+            while ((width * dim) % Q_CACHE_BLOCKSIZE_Q) width++;
+        }
+        offset *= dim;
+        width *= dim;
 
         array_fp16_to_q_kv_cuda
         (
+            stream,
             (const half*) k_in.data_ptr(),
             (unsigned char*) k_out.data_ptr(),
             (half*) k_scales.data_ptr(),
             (const half*) v_in.data_ptr(),
             (unsigned char*) v_out.data_ptr(),
             (half*) v_scales.data_ptr(),
-            tsize,
+            dim,
             stride,
             height,
             offset,
@@ -195,6 +207,7 @@ void q_to_fp16_kv
     TORCH_CHECK_DTYPE(k_in, kUInt8);
     TORCH_CHECK_DTYPE(k_out, kHalf);
     const at::cuda::OptionalCUDAGuard device_guard(device_of(k_in));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_SHAPES(k_out, 0, k_in, 0, 1);
     TORCH_CHECK_SHAPES(k_out, 1, k_in, 1, 1);
@@ -226,6 +239,7 @@ void q_to_fp16_kv
 
         array_q_to_fp16_kv_paged_cuda
         (
+            stream,
             (const unsigned char*) k_in.data_ptr(),
             (const half*) k_scales.data_ptr(),
             (half*) k_out.data_ptr(),
@@ -248,19 +262,25 @@ void q_to_fp16_kv
         int stride = k_out.size(1) * k_out.size(2) * k_out.size(3);
         int height = batch_size;
 
-        int tsize = k_out.size(2) * k_out.size(3);
-        offset *= tsize;
-        width *= tsize;
+        int dim = k_out.size(2) * k_out.size(3);
+        if (dim % Q_CACHE_BLOCKSIZE_Q)
+        {
+            while ((offset * dim) % Q_CACHE_BLOCKSIZE_Q) offset--;
+            while ((width * dim) % Q_CACHE_BLOCKSIZE_Q) width++;
+        }
+        offset *= dim;
+        width *= dim;
 
         array_q_to_fp16_kv_cuda
         (
+            stream,
             (const unsigned char*) k_in.data_ptr(),
             (const half*) k_scales.data_ptr(),
             (half*) k_out.data_ptr(),
             (const unsigned char*) v_in.data_ptr(),
             (const half*) v_scales.data_ptr(),
             (half*) v_out.data_ptr(),
-            tsize,
+            dim,
             stride,
             height,
             offset,
@@ -276,14 +296,14 @@ void q_to_fp16_kv
 //{
 //    TORCH_CHECK_DTYPE(in_tensor, kHalf);
 //    TORCH_CHECK_DTYPE(out_tensor, kUInt8);
-//    array_fp16_to_fp8_ref_cuda((const half*) (in_tensor.data_ptr()), (unsigned char*)(out_tensor.data_ptr()), size);
+//    array_fp16_to_fp8_ref_cuda(NULL, (const half*) (in_tensor.data_ptr()), (unsigned char*)(out_tensor.data_ptr()), size);
 //}
 //
 //void array_fp8_to_fp16_ref(torch::Tensor in_tensor, torch::Tensor out_tensor, int size)
 //{
 //    TORCH_CHECK_DTYPE(in_tensor, kUInt8);
 //    TORCH_CHECK_DTYPE(out_tensor, kHalf);
-//    array_fp8_to_fp16_ref_cuda((const unsigned char*)(in_tensor.data_ptr()), (half*)(out_tensor.data_ptr()), size);
+//    array_fp8_to_fp16_ref_cuda(NULL, (const unsigned char*)(in_tensor.data_ptr()), (half*)(out_tensor.data_ptr()), size);
 //}
 
 int count_match

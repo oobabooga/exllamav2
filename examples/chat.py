@@ -10,6 +10,7 @@ from exllamav2 import(
     ExLlamaV2Cache_Q4,
     ExLlamaV2Cache_Q6,
     ExLlamaV2Cache_Q8,
+    ExLlamaV2Cache_TP,
     ExLlamaV2Tokenizer,
     model_init,
 )
@@ -94,7 +95,7 @@ if system_prompt is None: system_prompt = prompt_format.default_system_prompt()
 
 model_init.check_args(args)
 model_init.print_options(args)
-model, tokenizer = model_init.init(args, allow_auto_split = True, max_output_len = 16)
+model, tokenizer = model_init.init(args, allow_auto_split = True, max_output_len = 16, skip_load = True)
 
 # Initialize draft model if provided, assume it always fits on first device
 
@@ -139,24 +140,34 @@ if args.draft_model_dir:
     else:
         draft_cache = ExLlamaV2Cache(draft_model)
 
+# Load model after draft model
+
+print(" -- Loading model...")
+
+model_init.post_init_load(model, args, allow_auto_split = True)
+
 # Create cache
 
 if args.cache_8bit:
-    cache = ExLlamaV2Cache_8bit(model, lazy = not model.loaded)
+    cache_type = ExLlamaV2Cache_8bit
 elif args.cache_q4:
-    cache = ExLlamaV2Cache_Q4(model, lazy = not model.loaded)
+    cache_type = ExLlamaV2Cache_Q4
 elif args.cache_q6:
-    cache = ExLlamaV2Cache_Q6(model, lazy=not model.loaded)
+    cache_type = ExLlamaV2Cache_Q6
 elif args.cache_q8:
-    cache = ExLlamaV2Cache_Q8(model, lazy = not model.loaded)
+    cache_type = ExLlamaV2Cache_Q8
 else:
-    cache = ExLlamaV2Cache(model, lazy = not model.loaded)
+    cache_type = ExLlamaV2Cache
+
+if model.tp_context:
+    cache = ExLlamaV2Cache_TP(model, base = cache_type)
+else:
+    cache = cache_type(model, lazy = not model.loaded)
 
 # Load model now if auto split enabled
 
 if not model.loaded:
 
-    print(" -- Loading model...")
     model.load_autosplit(cache)
 
 # Chat context

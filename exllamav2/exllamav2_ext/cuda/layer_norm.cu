@@ -184,6 +184,7 @@ fp_layer_norm_kernel pick_layer_norm_kernel(const int blocks_per_warp)
 
 void layer_norm_cuda
 (
+    cudaStream_t stream,
     const half* x,
     const half* w,
     const half* b,
@@ -191,7 +192,9 @@ void layer_norm_cuda
     const float epsilon,
     const int rows,
     const int dim,
-    const bool add_residual
+    const bool add_residual,
+    Graph* graph,
+    int label
 )
 {
     dim3 blockDim, gridDim;
@@ -204,5 +207,27 @@ void layer_norm_cuda
 
     int blocks_per_warp = DIVIDE(dim, NUM_THREADS * 2);
     fp_layer_norm_kernel kernel = pick_layer_norm_kernel(blocks_per_warp);
-    kernel<<<gridDim, blockDim>>>(x, w, b, y, epsilon, r_dim, rows, dim, add_residual);
+    kernel<<<gridDim, blockDim, 0, stream>>>(x, w, b, y, epsilon, r_dim, rows, dim, add_residual);
+    if (graph) graph->attach_label(stream, label, 0);
 }
+
+void layer_norm_cuda_update_x
+(
+    Graph* graph,
+    int label,
+    void* x
+)
+{
+    graph->update_param_ptr(label, 0, 0, x);
+}
+
+void layer_norm_cuda_update_y
+(
+    Graph* graph,
+    int label,
+    void* y
+)
+{
+    graph->update_param_ptr(label, 0, 3, y);
+}
+

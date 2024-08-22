@@ -17,7 +17,8 @@ uintptr_t make_q_mlp
     bool has_residual,
     torch::Tensor post_layernorm,
     torch::Tensor post_layernorm_bias,
-    bool residual_fp32
+    bool residual_fp32,
+    bool use_graphs
 );
 
 void free_q_mlp
@@ -90,10 +91,20 @@ void q_moe_mlp_forward_
 //    std::vector<std::unordered_map<uintptr_t, torch::Tensor>>& w3_lora_b
 //);
 
-
-
-
-
-
-
-
+void tp_mlp_forward_
+(
+    uintptr_t tp_context,
+    torch::Tensor hidden_states,
+    const std::vector<torch::Tensor> &temp_bc0,
+    const std::vector<torch::Tensor> &temp_bc1,
+    const std::vector<torch::Tensor> &temp_bc2,
+    const std::vector<torch::Tensor> &temp_gate,
+    const std::vector<torch::Tensor> &temp_up,
+    const std::vector<torch::Tensor> &temp_down,
+    const std::vector<torch::Tensor> &pre_layernorm,
+    float norm_epsilon,
+    const std::vector<uintptr_t> &gate,
+    const std::vector<uintptr_t> &up,
+    const std::vector<uintptr_t> &down,
+    bool act_gelu
+);

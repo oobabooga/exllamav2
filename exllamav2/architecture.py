@@ -1,4 +1,4 @@
-from enum import Enum
+from enum import IntEnum
 
 # Common keys
 
@@ -94,7 +94,7 @@ internlm2_keymap = [("$output.", "lm_head."),
                     (".attention.", ".self_attn."),
                     (".wo.", ".o_proj.")]
 
-class RopeStyle(Enum):
+class RopeStyle(IntEnum):
     NONE = 0
     GPTJ = 1
     NEOX = 2
@@ -181,6 +181,9 @@ class ExLlamaV2ArchParams:
         # Scale attn weights (GPT2 quirk, not important for inference)
         self.scale_attn_weights = False
 
+        # Model implementation works in tensor-parallel mode
+        self.supports_tp = False
+
         # Mistral
 
         if arch_string == "MistralForCausalLM":
@@ -201,6 +204,7 @@ class ExLlamaV2ArchParams:
             self.mlp_act_func = "silu"
             self.norm = "rmsnorm"
             self.rope_style = RopeStyle.NEOX
+            self.supports_tp = True
 
         # Mixtral
 
@@ -288,6 +292,7 @@ class ExLlamaV2ArchParams:
             self.norm = "rmsnorm"
             self.rope_style = RopeStyle.NEOX
             self.attention_bias_qkv = True
+            self.supports_tp = True
 
         # Gemma
 
@@ -613,6 +618,7 @@ class ExLlamaV2ArchParams:
             self.mlp_act_func = "silu"
             self.norm = "rmsnorm"
             self.rope_style = RopeStyle.NEOX
+            self.supports_tp = True
 
         # Arch overrides
 

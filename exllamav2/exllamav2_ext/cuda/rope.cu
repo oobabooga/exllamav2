@@ -171,6 +171,7 @@ __global__ void rope_cuda_qk_kernel
 
 void rope_cuda
 (
+    cudaStream_t stream,
     half* x,
     const half* sin,
     const half* cos,
@@ -195,7 +196,7 @@ void rope_cuda
     gridDim.y = DIVIDE(rows_per_batch, threads_y);
     gridDim.z = batch_size;
 
-    rope_cuda_kernel<<<gridDim, blockDim>>>
+    rope_cuda_kernel<<<gridDim, blockDim, 0, stream>>>
     (
         x,
         sin,
@@ -212,6 +213,7 @@ void rope_cuda
 
 void rope_cuda_qk
 (
+    cudaStream_t stream,
     half* x_q,
     half* x_k,
     const half* sin,
@@ -224,7 +226,9 @@ void rope_cuda_qk
     const int num_heads_k,
     const int past_len,
     const int32_t* past_lens,
-    const bool neox_style
+    const bool neox_style,
+    Graph* graph,
+    int label
 )
 {
     // For large batch sizes we risk exceeding grid dimension of 65535, so shift to block dimension instead
@@ -240,7 +244,7 @@ void rope_cuda_qk
     gridDim.y = DIVIDE(rows_per_batch, threads_y);
     gridDim.z = batch_size;
 
-    rope_cuda_qk_kernel<<<gridDim, blockDim>>>
+    rope_cuda_qk_kernel<<<gridDim, blockDim, 0, stream>>>
     (
         x_q,
         x_k,
@@ -256,6 +260,46 @@ void rope_cuda_qk
         threads_y,
         neox_style
     );
+
+    if (graph) graph->attach_label(stream, label, 0);
 }
 
+void rope_cuda_qk_update_q
+(
+    Graph* graph,
+    int label,
+    void* q
+)
+{
+    graph->update_param_ptr(label, 0, 0, q);
+}
 
+void rope_cuda_qk_update_k
+(
+    Graph* graph,
+    int label,
+    void* k
+)
+{
+    graph->update_param_ptr(label, 0, 1, k);
+}
+
+void rope_cuda_qk_update_past_len
+(
+    Graph* graph,
+    int label,
+    int past_len
+)
+{
+    graph->update_param_int(label, 0, 9, past_len);
+}
+
+void rope_cuda_qk_update_past_lens
+(
+    Graph* graph,
+    int label,
+    void* past_lens
+)
+{
+    graph->update_param_ptr(label, 0, 10, past_lens);
+}

@@ -8,8 +8,17 @@
 #include "q_gemm_autotune.cuh"
 #include "h_add.cuh"
 
+enum KernelSublabels
+{
+    CLEAR = 1,
+    GEMM_GPTQ,
+    GEMM_EXL2,
+    ADD,
+};
+
 void gemm_half_q_half_cuda_part
 (
+    cudaStream_t stream,
     const half* a,
     QMatrix* b,
     half* c,
@@ -20,19 +29,19 @@ void gemm_half_q_half_cuda_part
     bool clear,
     const half* r_weights,
     int r_weights_stride,
-    bool mul_r_weights
+    bool mul_r_weights,
+    Graph* graph,
+    int label
 )
 {
     if (!b->is_gptq)
     {
         int block_kn_size;
-        bool measure;
+        bool measure = false;
         AT_Result* atr;
         cudaEvent_t start, stop;
 
-        bool use_autotune = true;
-
-        if (!use_autotune)
+        if (!AT_USE_GEMM_AUTOTUNE)
         {
             block_kn_size = at_get_fallback_blocksize(b->device, size_m, size_n, size_k);
         }
@@ -65,7 +74,7 @@ void gemm_half_q_half_cuda_part
                     int c64 = atr->timings_64.size();
                     if (c32 + c64 == AT_NUM_MEASURE)
                     {
-                        at_select(atr);
+                        at_select(atr, b->device, size_m, size_k, size_n);
                         block_kn_size = atr->best;
                         measure = false;
                     }
@@ -97,14 +106,15 @@ void gemm_half_q_half_cuda_part
 
         if (measure)
         {
+            if (graph) printf(" ## Labeling graph in reconstruct/cuBLAS matmul");
             cudaEventCreate(&start);
             cudaEventCreate(&stop);
-            cudaEventRecord(start);
+            cudaEventRecord(start, stream);
         }
 
         // Launch kernel
 
-        kernel<<<gridDim, blockDim>>>
+        kernel<<<gridDim, blockDim, 0, stream>>>
         (
             a,
             b->cuda_q_weight,
@@ -127,12 +137,13 @@ void gemm_half_q_half_cuda_part
             r_weights,
             r_weights_stride
         );
+        if (graph) graph->attach_label(stream, label, KernelSublabels::GEMM_EXL2);
 
         // Finish measurement
 
         if (measure)
         {
-            cudaEventRecord(stop);
+            cudaEventRecord(stop, stream);
             cudaEventSynchronize(stop);
             float timing = 0.0f;
             cudaEventElapsedTime(&timing, start, stop);
@@ -165,7 +176,7 @@ void gemm_half_q_half_cuda_part
 //             print_global_mem(r_weights, 1, 1, 1);
 //         DBGI(r_weights_stride);
 
-        kernel<<<gridDim, blockDim>>>
+        kernel<<<gridDim, blockDim, 0, stream>>>
         (
             a,
             b->cuda_q_weight,
@@ -183,11 +194,13 @@ void gemm_half_q_half_cuda_part
             r_weights,
             r_weights_stride
         );
+        if (graph) graph->attach_label(stream, label, KernelSublabels::GEMM_GPTQ);
     }
 }
 
 void gemm_half_q_half_cuda
 (
+    cudaStream_t stream,
     cublasHandle_t cublas_handle,
     const half* a,
     QMatrix* b,
@@ -200,10 +213,16 @@ void gemm_half_q_half_cuda
     bool force_cuda,
     const half* r_weights,
     const int r_weights_stride,
-    bool mul_r_weights
+    bool mul_r_weights,
+    Graph* graph,
+    int label
 )
 {
-    if (b->cuda_bias && clear) cuda_vector_set_(c, b->cuda_bias, size_m, size_n);
+    if (b->cuda_bias && clear)
+    {
+        cuda_vector_set_(stream, c, b->cuda_bias, size_m, size_n);
+        if (graph) graph->attach_label(stream, label, KernelSublabels::CLEAR);
+    }
 
     // Here we force CUDA matmul for matrices that are too big to dequantize. This is necessary for the
     // extremely large output layers of some models. Splitting along K and dequantizing/multiplying in
@@ -215,6 +234,8 @@ void gemm_half_q_half_cuda
 
     if (size_m > MAX_Q_GEMM_ROWS && !force_cuda && size_k <= row_step)
     {
+        if (graph) printf(" ## Labeling graph in reconstruct/cuBLAS matmul");
+
         int row_b = 0;
         if (row_step == 0) row_step = size_k;
 
@@ -228,10 +249,11 @@ void gemm_half_q_half_cuda
             // Reconstruct FP16 matrix, then cuBLAS
 
             if (!temp_dq) temp_dq = b->temp_dq;
-            b->reconstruct(temp_dq, row_a, row_b);
+            b->reconstruct(stream, temp_dq, row_a, row_b);
 
             const half alpha = __float2half(1.0f);
             const half beta = (clear && !b->cuda_bias && row_a == 0) ? __float2half(0.0f) : __float2half(1.0f);
+            cublasSetStream(cublas_handle, stream);
             cublasHgemm(cublas_handle,
                         CUBLAS_OP_N,
                         CUBLAS_OP_N,
@@ -240,13 +262,6 @@ void gemm_half_q_half_cuda
                                 a + row_a, size_k,
                         &beta,  c,         size_n);
 
-//            cublasHgemm(cublas_handle,
-//                        CUBLAS_OP_N,
-//                        CUBLAS_OP_N,
-//                        size_n, size_m, size_k,
-//                        &alpha, temp_dq, size_n,
-//                                a,       size_k,
-//                        &beta,  c,       size_n);
         }
 
         //const float alpha = 1.0f;
@@ -277,17 +292,24 @@ void gemm_half_q_half_cuda
         int block_m = min(size_m, block_m_size_max);
         gemm_half_q_half_cuda_part
         (
+            stream,
             a, b, c,
             size_m, size_n, size_k,
             block_m,
             clear && !b->cuda_bias,
             r_weights,
             r_weights_stride,
-            mul_r_weights
+            mul_r_weights,
+            graph,
+            label
         );
     }
 
-    if (b->cuda_bias && !clear) cuda_vector_add_(c, b->cuda_bias, size_m, size_n);
+    if (b->cuda_bias && !clear)
+    {
+        cuda_vector_add_(stream, c, b->cuda_bias, size_m, size_n);
+        if (graph) graph->attach_label(stream, label, KernelSublabels::ADD);
+    }
 }
 
 __global__ void clear_kernel
@@ -306,6 +328,7 @@ __global__ void clear_kernel
 
 void clear_tensor_cuda
 (
+    cudaStream_t stream,
     half* c,
     int size_m,
     int size_n
@@ -316,5 +339,31 @@ void clear_tensor_cuda
 //     blockDim.y = 1;
 //     gridDim.x = DIVIDE(size_n / 8, CLEAR_N_SIZE);
 //     gridDim.y = size_m;
-//     clear_kernel<<<gridDim, blockDim>>>(c, size_m, size_n);
+//     clear_kernel<<<gridDim, blockDim, 0, stream>>>(c, size_m, size_n);
 }
+
+void q_gemm_cuda_update_a
+(
+    Graph* graph,
+    int label,
+    void* a
+)
+{
+    graph->update_param_ptr(label, KernelSublabels::GEMM_GPTQ, 0, a);
+    graph->update_param_ptr(label, KernelSublabels::GEMM_EXL2, 0, a);
+}
+
+void q_gemm_cuda_update_c
+(
+    Graph* graph,
+    int label,
+    void* c
+)
+{
+    graph->update_param_ptr(label, KernelSublabels::CLEAR, 0, c);
+    graph->update_param_ptr(label, KernelSublabels::GEMM_GPTQ, 4, c);
+    graph->update_param_ptr(label, KernelSublabels::GEMM_EXL2, 4, c);
+    graph->update_param_ptr(label, KernelSublabels::ADD, 0, c);
+}
+
+

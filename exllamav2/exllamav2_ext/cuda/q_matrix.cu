@@ -68,7 +68,9 @@ QMatrix::QMatrix
     half* _bias,
 
     half* _temp_dq,
-    const int _max_dq_rows
+    const int _max_dq_rows,
+
+    bool no_map
 ) :
     device(_device),
     height(_height),
@@ -171,6 +173,8 @@ QMatrix::QMatrix
 //     DBGI(rows_2);
 
     // Shuffle quantized data
+
+    if (no_map) return;
 
     dim3 blockDim, gridDim;
     blockDim.x = THREADS_X;
@@ -343,7 +347,7 @@ __global__ void reconstruct_kernel
 
     int t = threadIdx.x;
     __shared__ uint16_t perm[BLOCK_KN_SIZE];
-    if (offset_k + t < size_k)
+    if (b_q_perm && offset_k + t < size_k)
         perm[t] = b_q_perm[offset_k + t];
 
     // Column
@@ -378,7 +382,7 @@ __global__ void reconstruct_kernel
 
     int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
     int k = offset_k;
-    int lk = 0;
+    int lk = b_q_perm ? 0 : k;
 
     __syncthreads();
 
@@ -393,7 +397,7 @@ __global__ void reconstruct_kernel
             dequant_8bit_8(q_0, q_1, dq, size_n);
             for (int j = 0; j < 4; j++) dq[j] = __hmul2(dq[j], qs_h2);
             half* dqh = (half*) dq;
-            for (int j = 0; j < 8; j++) b_.set(perm[lk++], n, dqh[j]);
+            for (int j = 0; j < 8; j++) b_.set(b_q_perm ? perm[lk++] : lk++, n, dqh[j]);
         }
         k += 32;
     }
@@ -410,7 +414,7 @@ __global__ void reconstruct_kernel
             dequant_6bit_16(q_0, q_1, q_2, dq, size_n);
             for (int j = 0; j < 8; j++) dq[j] = __hmul2(dq[j], qs_h2);
             half* dqh = (half*) dq;
-            for (int j = 0; j < 16; j++) b_.set(perm[lk++], n, dqh[j]);
+            for (int j = 0; j < 16; j++) b_.set(b_q_perm ? perm[lk++] : lk++, n, dqh[j]);
         }
         k += 32;
     }
@@ -429,7 +433,7 @@ __global__ void reconstruct_kernel
             dequant_5bit_32(q_0, q_1, q_2, q_3, q_4, dq, size_n);
             for (int j = 0; j < 16; j++) dq[j] = __hmul2(dq[j], qs_h2);
             half* dqh = (half*) dq;
-            for (int j = 0; j < 32; j++) b_.set(perm[lk++], n, dqh[j]);
+            for (int j = 0; j < 32; j++) b_.set(b_q_perm ? perm[lk++] : lk++, n, dqh[j]);
         }
         k += 32;
     }
@@ -444,7 +448,7 @@ __global__ void reconstruct_kernel
             dequant_4bit_8(q_0, dq, size_n);
             for (int j = 0; j < 4; j++) dq[j] = __hmul2(dq[j], qs_h2);
             half* dqh = (half*) dq;
-            for (int j = 0; j < 8; j++) b_.set(perm[lk++], n, dqh[j]);
+            for (int j = 0; j < 8; j++) b_.set(b_q_perm ? perm[lk++] : lk++, n, dqh[j]);
         }
         k += 32;
     }
@@ -461,7 +465,7 @@ __global__ void reconstruct_kernel
             dequant_3bit_32(q_0, q_1, q_2, dq, size_n);
             for (int j = 0; j < 16; j++) dq[j] = __hmul2(dq[j], qs_h2);
             half* dqh = (half*) dq;
-            for (int j = 0; j < 32; j++) b_.set(perm[lk++], n, dqh[j]);
+            for (int j = 0; j < 32; j++) b_.set(b_q_perm ? perm[lk++] : lk++, n, dqh[j]);
         }
         k += 32;
     }
@@ -476,13 +480,13 @@ __global__ void reconstruct_kernel
             dequant_2bit_16(q_0, dq, size_n);
             for (int j = 0; j < 8; j++) dq[j] = __hmul2(dq[j], qs_h2);
             half* dqh = (half*) dq;
-            for (int j = 0; j < 16; j++) b_.set(perm[lk++], n, dqh[j]);
+            for (int j = 0; j < 16; j++) b_.set(b_q_perm ? perm[lk++] : lk++, n, dqh[j]);
         }
         k += 16;
     }
 }
 
-void QMatrix::reconstruct(half* out, int row_a, int row_b)
+void QMatrix::reconstruct(cudaStream_t stream, half* out, int row_a, int row_b)
 {
     dim3 blockDim, gridDim;
     blockDim.x = BLOCK_KN_SIZE;
@@ -494,7 +498,7 @@ void QMatrix::reconstruct(half* out, int row_a, int row_b)
     if (!is_gptq)
     {
         gridDim.x = DIVIDE(width, BLOCK_KN_SIZE);
-        reconstruct_kernel<<<gridDim, blockDim>>>
+        reconstruct_kernel<<<gridDim, blockDim, 0, stream>>>
         (
             cuda_q_weight,
             cuda_q_perm,
@@ -519,7 +523,7 @@ void QMatrix::reconstruct(half* out, int row_a, int row_b)
     else
     {
         gridDim.x = DIVIDE(width, BLOCK_KN_SIZE * 4);
-        reconstruct_gptq_kernel<<<gridDim, blockDim>>>
+        reconstruct_gptq_kernel<<<gridDim, blockDim, 0, stream>>>
         (
             cuda_q_weight,
             cuda_q_perm,
@@ -711,6 +715,7 @@ __global__ void matrix_fp16_to_fp8_kernel
 
 void matrix_fp8_to_fp16_cuda
 (
+    cudaStream_t stream,
     const uint8_t* in_ptr,
     half* out_ptr,
     int numel
@@ -722,11 +727,12 @@ void matrix_fp8_to_fp16_cuda
     dim3 blockDim, gridDim;
     blockDim.x = THREADS_F;
     gridDim.x = numel / (BLOCKSIZE_F * THREADS_F);
-    matrix_fp8_to_fp16_kernel<<<gridDim, blockDim>>>(in_ptr, out_ptr);
+    matrix_fp8_to_fp16_kernel<<<gridDim, blockDim, 0, stream>>>(in_ptr, out_ptr);
 }
 
 void matrix_fp16_to_fp8_cuda
 (
+    cudaStream_t stream,
     const half* in_ptr,
     uint8_t* out_ptr,
     int numel
@@ -738,13 +744,14 @@ void matrix_fp16_to_fp8_cuda
     dim3 blockDim, gridDim;
     blockDim.x = THREADS_F;
     gridDim.x = numel / (BLOCKSIZE_F * THREADS_F);
-    matrix_fp16_to_fp8_kernel<<<gridDim, blockDim>>>(in_ptr, out_ptr);
+    matrix_fp16_to_fp8_kernel<<<gridDim, blockDim, 0, stream>>>(in_ptr, out_ptr);
 }
 
 // Q4/FP16 convert funcs
 
 void matrix_q4_to_fp16_cuda
 (
+    cudaStream_t stream,
     const uint8_t* in_ptr,
     const half* scales_ptr,
     half* out_ptr,
@@ -753,6 +760,7 @@ void matrix_q4_to_fp16_cuda
 {
     array_q_to_fp16_kv_cuda
     (
+        stream,
         in_ptr,
         scales_ptr,
         out_ptr,
@@ -772,6 +780,7 @@ void matrix_q4_to_fp16_cuda
 
 void matrix_fp16_to_q4_cuda
 (
+    cudaStream_t stream,
     const half* in_ptr,
     uint8_t* out_ptr,
     half* scales_ptr,
@@ -780,6 +789,7 @@ void matrix_fp16_to_q4_cuda
 {
     array_fp16_to_q_kv_cuda
     (
+        stream,
         in_ptr,
         out_ptr,
         scales_ptr,

@@ -26,6 +26,7 @@ void gemm_half_half_half
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(a, kHalf);
     TORCH_CHECK_DTYPE(c, kHalf);
@@ -37,6 +38,7 @@ void gemm_half_half_half
     {
         h_gemm_cublas
         (
+            stream,
             at::cuda::getCurrentCUDABlasHandle(),
             c.size(0), // m
             c.size(1), // n
@@ -52,6 +54,7 @@ void gemm_half_half_half
     {
         h_gemm_cuda
         (
+            stream,
             at::cuda::getCurrentCUDABlasHandle(),
             c.size(0), // m
             c.size(1), // n

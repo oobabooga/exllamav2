@@ -8,10 +8,32 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "q_matrix.cuh"
+#include "graph.cuh"
 
 #define ROPE_STYLE_NONE 0
 #define ROPE_STYLE_GPTJ 1
 #define ROPE_STYLE_NEOX 2
+
+struct QAttn_params_const
+{
+    int batch_size;
+    int q_len;
+
+    bool operator==(const QAttn_params_const& other) const
+    {
+        return batch_size == other.batch_size &&
+               q_len == other.q_len;
+    }
+};
+
+struct QAttn_params_const_hash
+{
+    std::size_t operator()(const QAttn_params_const& key) const
+    {
+        return (std::hash<int>()(key.batch_size)) ^
+               (std::hash<int>()(key.q_len) << 1);
+    }
+};
 
 class QAttn
 {
@@ -55,6 +77,9 @@ public:
     bool residual_fp32;
     int rope_style;
 
+    bool use_graphs;
+    std::unordered_map<QAttn_params_const, Graph*, QAttn_params_const_hash> graph_map;
+
     QAttn
     (
         half* _layernorm,
@@ -82,19 +107,21 @@ public:
         half* _k_norm,
         half* _post_layernorm,
         half* _post_layernorm_bias,
-        bool _residual_fp32
+        bool _residual_fp32,
+        bool _use_graphs
     );
 
     ~QAttn();
 
     void forward_cuda_1
     (
+        cudaStream_t stream,
         cublasHandle_t cublas_handle,
         void* x,
         int batch_size,
         int q_len,
         int past_len,
-        const int32_t* past_lens,
+        int32_t* past_lens,
         half* temp_q,
         half* temp_k,
         half* temp_v,
@@ -104,8 +131,28 @@ public:
         half* lora_temp
     );
 
+    void forward_cuda_1_run
+    (
+        cudaStream_t stream,
+        cublasHandle_t cublas_handle,
+        void* x,
+        int batch_size,
+        int q_len,
+        int past_len,
+        int32_t* past_lens,
+        half* temp_q,
+        half* temp_k,
+        half* temp_v,
+        const half* sin,
+        const half* cos,
+        const std::vector<uintptr_t>& loras,
+        half* lora_temp,
+        Graph* graph = NULL
+    );
+
     void forward_cuda_2
     (
+        cudaStream_t stream,
         cublasHandle_t cublas_handle,
         const half* attn_output,
         void* hidden_state,

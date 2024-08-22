@@ -12,8 +12,12 @@
 #include "ext_qmlp.h"
 
 #include "cuda/q_mlp.cuh"
+#include "cuda/rms_norm.cuh"
+#include "cuda/q_gemm.cuh"
 
 #include "cpp/util.h"
+#include "ext_tp.h"
+#include "ext_qmatrix.h"
 
 uintptr_t make_q_mlp
 (
@@ -33,7 +37,8 @@ uintptr_t make_q_mlp
     bool has_residual,
     torch::Tensor post_layernorm,
     torch::Tensor post_layernorm_bias,
-    bool residual_fp32
+    bool residual_fp32,
+    bool use_graphs
 )
 {
     QMatrix* qm_gate = reinterpret_cast<QMatrix*> (q_gate);
@@ -47,23 +52,24 @@ uintptr_t make_q_mlp
 
     QMLP* mlp = new QMLP
     (
-        (half*) layernorm.is_meta() ? NULL : (half*) layernorm.data_ptr(),
-        (half*) layernorm_bias.is_meta() ? NULL : (half*) layernorm_bias.data_ptr(),
+        layernorm.is_meta() ? NULL : (half*) layernorm.data_ptr(),
+        layernorm_bias.is_meta() ? NULL : (half*) layernorm_bias.data_ptr(),
         layernorm_is_rms,
         norm_epsilon,
         qm_gate,
         qm_up,
         qm_down,
-        (half*) temp_state.data_ptr(),
-        (half*) temp_a.data_ptr(),
-        (half*) temp_b.data_ptr(),
-        (half*) temp_dq.data_ptr(),
+        temp_state.is_meta() ? NULL : (half*) temp_state.data_ptr(),
+        temp_a.is_meta() ? NULL : (half*) temp_a.data_ptr(),
+        temp_b.is_meta() ? NULL : (half*) temp_b.data_ptr(),
+        temp_dq.is_meta() ? NULL : (half*) temp_dq.data_ptr(),
         max_rows,
         act_gelu,
         has_residual,
-        (half*) post_layernorm.is_meta() ? NULL : (half*) post_layernorm.data_ptr(),
-        (half*) post_layernorm_bias.is_meta() ? NULL : (half*) post_layernorm_bias.data_ptr(),
-        residual_fp32
+        post_layernorm.is_meta() ? NULL : (half*) post_layernorm.data_ptr(),
+        post_layernorm_bias.is_meta() ? NULL : (half*) post_layernorm_bias.data_ptr(),
+        residual_fp32,
+        use_graphs
     );
 
     return reinterpret_cast<uintptr_t> (mlp);
@@ -91,6 +97,7 @@ void q_mlp_forward_
     else                    { TORCH_CHECK_DTYPE(x, kHalf); }
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     int dim = x.size(-1);
     int rows = x.numel() / dim;
@@ -100,6 +107,7 @@ void q_mlp_forward_
 
     mlp->forward_
     (
+        stream,
         at::cuda::getCurrentCUDABlasHandle(),
         (void*) x.data_ptr(),
         rows,
@@ -246,12 +254,14 @@ void q_moe_mlp_forward_
     TORCH_CHECK_DTYPE(x, kHalf);
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK(x.size(1) == moe_mlp->hidden_dim, "x is wrong shape");
     TORCH_CHECK(x.size(0) <= moe_mlp->max_rows, "Too many rows in x");
 
     moe_mlp->forward_
     (
+        stream,
         at::cuda::getCurrentCUDABlasHandle(),
         (half*) x.data_ptr(),
         x.size(0), // rows
@@ -312,3 +322,152 @@ void q_moe_mlp_forward_
 //
 //    return max_rank;
 //}
+
+void tp_mlp_forward_
+(
+    uintptr_t tp_context,
+    torch::Tensor hidden_states,
+    const std::vector<torch::Tensor> &temp_bc0_,
+    const std::vector<torch::Tensor> &temp_bc1_,
+    const std::vector<torch::Tensor> &temp_bc2_,
+    const std::vector<torch::Tensor> &temp_gate_,
+    const std::vector<torch::Tensor> &temp_up_,
+    const std::vector<torch::Tensor> &temp_down_,
+    const std::vector<torch::Tensor> &pre_layernorm,
+    float norm_epsilon,
+    const std::vector<uintptr_t> &gate,
+    const std::vector<uintptr_t> &up,
+    const std::vector<uintptr_t> &down,
+    bool act_gelu
+)
+{
+    ExtTPContext* ctx = reinterpret_cast<ExtTPContext*> (tp_context);
+    int rows = hidden_states.size(0);
+    int interm_dim = temp_bc2_[0].size(1);
+    int hidden_dim = temp_bc1_[0].size(1);
+
+    std::vector<torch::Tensor> temp_bc0;
+    std::vector<torch::Tensor> temp_bc1;
+    std::vector<torch::Tensor> temp_bc2;
+    std::vector<torch::Tensor> temp_gate;
+    std::vector<torch::Tensor> temp_up;
+    std::vector<torch::Tensor> temp_down;
+    for (const auto &item : temp_bc0_) temp_bc0.push_back(item.narrow(0, 0, rows));
+    for (const auto &item : temp_bc1_) temp_bc1.push_back(item.narrow(0, 0, rows));
+    for (const auto &item : temp_bc2_) temp_bc2.push_back(item.narrow(0, 0, rows));
+    for (const auto &item : temp_gate_) temp_gate.push_back(item.narrow(0, 0, rows));
+    for (const auto &item : temp_up_) temp_up.push_back(item.narrow(0, 0, rows));
+    for (const auto &item : temp_down_) temp_down.push_back(item.narrow(0, 0, rows));
+
+    auto run_thread = [&] (int t_device, Barrier* sync) -> void
+    {
+        #ifdef TP_MULTITHREADED
+            at::InferenceMode guard(true);
+        #endif
+
+        // Broadcast
+
+        tp_broadcast(tp_context, 0, hidden_states, BROADCAST_ID, temp_bc0, 1, t_device);
+
+        // Layernorm
+
+        for (int i = 0; i < pre_layernorm.size(); ++i)
+        {
+            int dev = temp_bc0[i].device().index();
+            if (t_device != -1 && t_device != dev) continue;
+
+            cudaSetDevice(dev);
+            rms_norm_cuda
+            (
+                ctx->streams[dev],
+                (void*) temp_bc0[i].data_ptr(),
+                (half*) pre_layernorm[i].data_ptr(),
+                (void*) temp_bc1[i].data_ptr(),
+                norm_epsilon,
+                rows,
+                hidden_dim,
+                false,
+                false,  // TODO: FP32 residual
+                false
+            );
+        }
+
+        // Up, gate
+
+        gemm_half_q_half_tp(temp_bc1, gate, temp_gate, false, tp_context, t_device);
+        gemm_half_q_half_tp(temp_bc1, up, temp_up, false, tp_context, t_device);
+
+        // Act/mul
+
+        for (int i = 0; i < temp_bc1.size(); ++i)
+        {
+            int dev = temp_bc1[i].device().index();
+            if (t_device != -1 && t_device != dev) continue;
+
+            cudaSetDevice(dev);
+            act_mul_cuda
+            (
+                ctx->streams[dev],
+                (half*) temp_gate[i].data_ptr(),
+                (half*) temp_up[i].data_ptr(),
+                rows,
+                temp_gate[i].size(1),
+                act_gelu
+            );
+        }
+
+        // Allgather
+
+        tp_gather_barrier(tp_context, 1, temp_gate, BROADCAST_ID, temp_bc2, BROADCAST_ID, 1, t_device, sync);
+
+        // Down
+
+        gemm_half_q_half_tp(temp_bc2, down, temp_down, false, tp_context, t_device);
+
+        // Add residual
+        // TODO: libtorch adds a bit of overhead here that could be removed with a custom strided add_ kernel
+        // TODO: Currently runs only on the first thread, seems libtorch in-place operations are not threadsafe?
+
+        if (t_device == -1 || t_device == ctx->all_devices[0])
+        {
+            int offset = 0;
+            for (int i = 0; i < temp_bc0.size(); ++i)
+            {
+                int dev = temp_bc0[i].device().index();
+                cudaSetDevice(dev);
+
+                auto stream = at::cuda::getStreamFromExternal(ctx->streams[dev], dev);
+                at::cuda::setCurrentCUDAStream(stream);
+
+                int w = temp_down[i].size(1);
+                auto res_slice = temp_bc0[i].narrow(1, offset, w);
+                temp_down[i].add_(res_slice);
+                offset += w;
+            }
+        }
+
+        if (t_device != -1)
+            sync->arrive_and_wait();
+
+        // Gather
+
+        tp_gather_barrier(tp_context, 0, temp_down, BROADCAST_RS, temp_down, -1, 1, t_device, sync);
+
+    };
+
+    #ifdef TP_MULTITHREADED
+
+        std::vector<std::future<void>> threads;
+        Barrier sync_point(ctx->all_devices.size());
+        for (const auto &dev : ctx->all_devices)
+            threads.push_back(ctx->thread_pool->enqueue(run_thread, dev, &sync_point));
+        for (auto &t : threads)
+            t.get();
+
+    #else
+
+        run_thread(-1, NULL);
+
+    #endif
+
+}

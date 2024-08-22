@@ -20,6 +20,7 @@
 #include "ext_norm.h"
 #include "ext_rope.h"
 #include "ext_element.h"
+#include "ext_tp.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -58,9 +59,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     // qmatrix
 
     m.def("make_q_matrix", &make_q_matrix, "make_q_matrix");
+    m.def("make_q_matrix_split", &make_q_matrix_split, "make_q_matrix_split");
     m.def("free_q_matrix", &free_q_matrix, "free_q_matrix");
     m.def("reconstruct", &reconstruct, "reconstruct");
     m.def("gemm_half_q_half", &gemm_half_q_half, "gemm_half_q_half");
+    m.def("gemm_half_q_half_tp", &gemm_half_q_half_tp, "gemm_half_q_half_tp");
     m.def("matrix_fp16_to_q4", &matrix_fp16_to_q4, "matrix_fp16_to_q4");
     m.def("matrix_q4_to_fp16", &matrix_q4_to_fp16, "matrix_q4_to_fp16");
 
@@ -71,6 +74,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("q_attn_forward_1", &q_attn_forward_1, "q_attn_forward_1");
     m.def("q_attn_forward_2", &q_attn_forward_2, "q_attn_forward_2");
     m.def("q_attn_set_loras", &q_attn_set_loras, "q_attn_set_loras");
+    m.def("tp_attn_forward_paged_", &tp_attn_forward_paged_, "tp_attn_forward_paged_");
+    m.def("tp_attn_forward_", &tp_attn_forward_, "tp_attn_forward_");
+    m.def("set_flash_attn_func", &set_flash_attn_func, "set_flash_attn_func");
 
     // qmlp
 
@@ -81,6 +87,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("q_mlp_forward_", &q_mlp_forward_, "q_mlp_forward_");
     m.def("q_mlp_set_loras", &q_mlp_set_loras, "q_mlp_set_loras");
     m.def("q_moe_mlp_forward_", &q_moe_mlp_forward_, "q_moe_mlp_forward_");
+    m.def("tp_mlp_forward_", &tp_mlp_forward_, "tp_mlp_forward_");
 //    m.def("q_moe_mlp_set_loras", &q_moe_mlp_set_loras, "q_moe_mlp_set_loras");
 
     // cache
@@ -106,6 +113,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("rms_norm", &rms_norm, "rms_norm");
     m.def("rms_norm_", &rms_norm_, "rms_norm_");
+    m.def("rms_norm_tp", &rms_norm_tp, "rms_norm_tp");
     m.def("layer_norm", &layer_norm, "layer_norm");
     m.def("layer_norm_", &layer_norm_, "layer_norm_");
     m.def("head_norm", &head_norm, "head_norm");
@@ -118,4 +126,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     // element
 
     m.def("softcap_", &softcap_, "softcap_");
+
+    // tp
+
+    m.def("make_tp_context", &make_tp_context, "make_tp_context");
+    m.def("free_tp_context", &free_tp_context, "free_tp_context");
+    m.def("tp_broadcast", &tp_broadcast, "tp_broadcast");
+    m.def("tp_gather", &tp_gather, "tp_gather");
+    m.def("tp_cross_device_barrier", &tp_cross_device_barrier, "tp_cross_device_barrier");
+    m.def("tp_all_reduce", &tp_all_reduce, "tp_all_reduce");
 }

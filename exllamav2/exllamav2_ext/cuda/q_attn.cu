@@ -6,12 +6,24 @@
 #include "rope.cuh"
 #include "util.cuh"
 #include "lora.cuh"
+#include "../config.h"
 
 const int THREADS_X = 32;
 const int THREADS_Y = 1;
 const int THREADS_Z = 4;
 const int BLOCKSIZE_X = 2; // 2*half == 1*uint32_t
 const int BLOCKSIZE_Z = 4; // num_heads must be divisible by BLOCKSIZE_Z
+
+enum KernelLabels
+{
+    NORM = 1,
+    Q,
+    K,
+    V,
+    Q_NORM,
+    K_NORM,
+    ROPE
+};
 
 __global__ void update_cache_kernel
 (
@@ -96,7 +108,8 @@ QAttn::QAttn
     half* _k_norm,
     half* _post_layernorm,
     half* _post_layernorm_bias,
-    bool _residual_fp32
+    bool _residual_fp32,
+    bool _use_graphs
 ):
     layernorm(_layernorm),
     layernorm_bias(_layernorm_bias),
@@ -123,22 +136,25 @@ QAttn::QAttn
     k_norm(_k_norm),
     post_layernorm(_post_layernorm),
     post_layernorm_bias(_post_layernorm_bias),
-    residual_fp32(_residual_fp32)
+    residual_fp32(_residual_fp32),
+    use_graphs(_use_graphs)
 {
 }
 
 QAttn::~QAttn()
 {
+    for (const auto& pair : graph_map) delete pair.second;
 }
 
 void QAttn::forward_cuda_1
 (
+    cudaStream_t stream,
     cublasHandle_t cublas_handle,
     void* x,
     int batch_size,
     int q_len,
     int past_len,
-    const int32_t* past_lens,
+    int32_t* past_lens,
     half* temp_q,
     half* temp_k,
     half* temp_v,
@@ -148,38 +164,134 @@ void QAttn::forward_cuda_1
     half* lora_temp
 )
 {
+    // Don't use graph if LoRAs enabled or if module might invoke cuBLAS
+
+    if (!use_graphs || loras.size() || q_len * batch_size > MAX_Q_GEMM_ROWS)
+    {
+        forward_cuda_1_run(stream, cublas_handle, x, batch_size, q_len, past_len, past_lens, temp_q, temp_k, temp_v, sin, cos, loras, lora_temp);
+        return;
+    }
+
+    QAttn_params_const pc = { q_len, batch_size };
+    auto it = graph_map.find(pc);
+    Graph* graph;
+    if (it == graph_map.end())
+    {
+        graph = new Graph();
+        graph_map[pc] = graph;
+//        printf("**** new graph ****\n");
+//        DBGI2(q_len, batch_size);
+//        DBGX(x);
+    }
+    else graph = it->second;
+    if (graph->count())
+    {
+        graph->begin_capture(stream);
+        forward_cuda_1_run(stream, cublas_handle, x, batch_size, q_len, past_len, past_lens, temp_q, temp_k, temp_v, sin, cos, loras, lora_temp, graph);
+        graph->end_capture(stream);
+//        printf("**** record ****\n");
+//        DBGI2(q_len, batch_size);
+//        DBGX(x);
+    }
+    if (graph->ready())
+    {
+        if (layernorm)
+        {
+            if (layernorm_is_rms)
+                rms_norm_cuda_update_x(graph, KernelLabels::NORM, x);
+            else
+                layer_norm_cuda_update_x(graph, KernelLabels::NORM, x);
+        }
+        else
+        {
+            q_gemm_cuda_update_a(graph, KernelLabels::Q, x);
+            q_gemm_cuda_update_a(graph, KernelLabels::K, x);
+            q_gemm_cuda_update_a(graph, KernelLabels::V, x);
+        }
+
+        q_gemm_cuda_update_c(graph, KernelLabels::Q, temp_q);
+        q_gemm_cuda_update_c(graph, KernelLabels::K, temp_k);
+        q_gemm_cuda_update_c(graph, KernelLabels::V, temp_v);
+
+        if (q_norm)
+        {
+            head_norm_cuda_update_x(graph, KernelLabels::Q_NORM, temp_q);
+            head_norm_cuda_update_y(graph, KernelLabels::Q_NORM, temp_q);
+        }
+        if (k_norm)
+        {
+            head_norm_cuda_update_x(graph, KernelLabels::K_NORM, temp_k);
+            head_norm_cuda_update_y(graph, KernelLabels::K_NORM, temp_k);
+        }
+
+        if (rope_style != ROPE_STYLE_NONE)
+        {
+            rope_cuda_qk_update_q(graph, KernelLabels::ROPE, temp_q);
+            rope_cuda_qk_update_k(graph, KernelLabels::ROPE, temp_k);
+            rope_cuda_qk_update_past_len(graph, KernelLabels::ROPE, past_len);
+            rope_cuda_qk_update_past_lens(graph, KernelLabels::ROPE, past_lens);
+        }
+
+        graph->launch(stream);
+    }
+    else
+    {
+        forward_cuda_1_run(stream, cublas_handle, x, batch_size, q_len, past_len, past_lens, temp_q, temp_k, temp_v, sin, cos, loras, lora_temp);
+    }
+}
+
+void QAttn::forward_cuda_1_run
+(
+    cudaStream_t stream,
+    cublasHandle_t cublas_handle,
+    void* x,
+    int batch_size,
+    int q_len,
+    int past_len,
+    int32_t* past_lens,
+    half* temp_q,
+    half* temp_k,
+    half* temp_v,
+    const half* sin,
+    const half* cos,
+    const std::vector<uintptr_t>& loras,
+    half* lora_temp,
+    Graph* graph
+)
+{
     half* norm_state = (half*) x;
 
     if (layernorm)
     {
         if (layernorm_is_rms)
-            rms_norm_cuda(x, layernorm, temp_state, norm_epsilon, q_len * batch_size, hidden_size, false, residual_fp32, false);
+            rms_norm_cuda(stream, x, layernorm, temp_state, norm_epsilon, q_len * batch_size, hidden_size, false, residual_fp32, false, graph, KernelLabels::NORM);
         else
-            layer_norm_cuda((half*)x, layernorm, layernorm_bias, temp_state, norm_epsilon, q_len * batch_size, hidden_size);
+            layer_norm_cuda(stream, (half*)x, layernorm, layernorm_bias, temp_state, norm_epsilon, q_len * batch_size, hidden_size, false, graph, KernelLabels::NORM);
         norm_state = temp_state;
     }
 
-    gemm_half_q_half_cuda(cublas_handle, norm_state, q_proj, temp_q, q_len * batch_size, q_proj->width, hidden_size, true, temp_dq);
-    gemm_half_q_half_cuda(cublas_handle, norm_state, k_proj, temp_k, q_len * batch_size, k_proj->width, hidden_size, true, temp_dq);
-    gemm_half_q_half_cuda(cublas_handle, norm_state, v_proj, temp_v, q_len * batch_size, v_proj->width, hidden_size, true, temp_dq);
+    gemm_half_q_half_cuda(stream, cublas_handle, norm_state, q_proj, temp_q, q_len * batch_size, q_proj->width, hidden_size, true, temp_dq, false, NULL, 0, false, graph, KernelLabels::Q);
+    gemm_half_q_half_cuda(stream, cublas_handle, norm_state, k_proj, temp_k, q_len * batch_size, k_proj->width, hidden_size, true, temp_dq, false, NULL, 0, false, graph, KernelLabels::K);
+    gemm_half_q_half_cuda(stream, cublas_handle, norm_state, v_proj, temp_v, q_len * batch_size, v_proj->width, hidden_size, true, temp_dq, false, NULL, 0, false, graph, KernelLabels::V);
 
-    apply_loras_cuda(cublas_handle, q_proj_lora, loras, q_proj, norm_state, temp_q, lora_temp, q_len * batch_size);
-    apply_loras_cuda(cublas_handle, k_proj_lora, loras, k_proj, norm_state, temp_k, lora_temp, q_len * batch_size);
-    apply_loras_cuda(cublas_handle, v_proj_lora, loras, v_proj, norm_state, temp_v, lora_temp, q_len * batch_size);
+    apply_loras_cuda(stream, cublas_handle, q_proj_lora, loras, q_proj, norm_state, temp_q, lora_temp, q_len * batch_size);
+    apply_loras_cuda(stream, cublas_handle, k_proj_lora, loras, k_proj, norm_state, temp_k, lora_temp, q_len * batch_size);
+    apply_loras_cuda(stream, cublas_handle, v_proj_lora, loras, v_proj, norm_state, temp_v, lora_temp, q_len * batch_size);
 
     if (q_norm)
-        head_norm_cuda(temp_q, q_norm, NULL, temp_q, norm_epsilon, q_len * batch_size, num_heads, head_dim);
+        head_norm_cuda(stream, temp_q, q_norm, NULL, temp_q, norm_epsilon, q_len * batch_size, num_heads, head_dim, graph, KernelLabels::Q_NORM);
 
     if (k_norm)
-        head_norm_cuda(temp_k, k_norm, NULL, temp_k, norm_epsilon, q_len * batch_size, num_kv_heads, head_dim);
+        head_norm_cuda(stream, temp_k, k_norm, NULL, temp_k, norm_epsilon, q_len * batch_size, num_kv_heads, head_dim, graph, KernelLabels::K_NORM);
 
-//    rope_cuda(temp_q, sin, cos, batch_size, q_len * num_heads,    head_dim, num_heads,    past_len, past_lens);
-//    rope_cuda(temp_k, sin, cos, batch_size, q_len * num_kv_heads, head_dim, num_kv_heads, past_len, past_lens);
+//    rope_cuda(stream, temp_q, sin, cos, batch_size, q_len * num_heads,    head_dim, num_heads,    past_len, past_lens);
+//    rope_cuda(stream, temp_k, sin, cos, batch_size, q_len * num_kv_heads, head_dim, num_kv_heads, past_len, past_lens);
 
     if (rope_style != ROPE_STYLE_NONE)
     {
         rope_cuda_qk
         (
+            stream,
             temp_q,
             temp_k,
             sin,
@@ -192,13 +304,16 @@ void QAttn::forward_cuda_1
             num_kv_heads,
             past_len,
             past_lens,
-            rope_style == ROPE_STYLE_NEOX
+            rope_style == ROPE_STYLE_NEOX,
+            graph,
+            KernelLabels::ROPE
         );
     }
 }
 
 void QAttn::forward_cuda_2
 (
+    cudaStream_t stream,
     cublasHandle_t cublas_handle,
     const half* attn_output,
     void* hidden_state,
@@ -210,16 +325,16 @@ void QAttn::forward_cuda_2
 {
     if (!post_layernorm)
     {
-        gemm_half_q_half_cuda(cublas_handle, attn_output, o_proj, (half*) hidden_state, q_len * batch_size, o_proj->width, o_proj->height, !has_residual, temp_dq);
+        gemm_half_q_half_cuda(stream, cublas_handle, attn_output, o_proj, (half*) hidden_state, q_len * batch_size, o_proj->width, o_proj->height, !has_residual, temp_dq);
     }
     else
     {
-        gemm_half_q_half_cuda(cublas_handle, attn_output, o_proj, temp_state, q_len * batch_size, o_proj->width, o_proj->height, true, temp_dq);
+        gemm_half_q_half_cuda(stream, cublas_handle, attn_output, o_proj, temp_state, q_len * batch_size, o_proj->width, o_proj->height, true, temp_dq);
         if (layernorm_is_rms)
-            rms_norm_cuda(temp_state, post_layernorm, hidden_state, norm_epsilon, q_len * batch_size, hidden_size, true, false, residual_fp32);
+            rms_norm_cuda(stream, temp_state, post_layernorm, hidden_state, norm_epsilon, q_len * batch_size, hidden_size, true, false, residual_fp32);
         else
-            layer_norm_cuda(temp_state, post_layernorm, post_layernorm_bias, (half*) hidden_state, norm_epsilon, q_len * batch_size, hidden_size, true);
+            layer_norm_cuda(stream, temp_state, post_layernorm, post_layernorm_bias, (half*) hidden_state, norm_epsilon, q_len * batch_size, hidden_size, true);
     }
 
-    apply_loras_cuda(cublas_handle, o_proj_lora, loras, o_proj, attn_output, (half*) hidden_state, lora_temp, q_len * batch_size);
+    apply_loras_cuda(stream, cublas_handle, o_proj_lora, loras, o_proj, attn_output, (half*) hidden_state, lora_temp, q_len * batch_size);
 }

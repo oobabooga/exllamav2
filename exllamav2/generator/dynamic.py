@@ -1729,6 +1729,8 @@ class ExLlamaV2DynamicJob:
 
         # Start filters
 
+        # TODO: Try to move filter evaluation to the end of the forward pass, before sampling so it can potentially
+        #   occur while waiting for the CUDA queue
         if self.new_tokens == 0:
             for f in self.filters: f.begin("")
 
@@ -1912,8 +1914,8 @@ class ExLlamaV2DynamicJob:
                     "time_enqueued": self.time_first_prefill - self.time_enqueue,
                     "time_prefill": self.time_first_token - self.time_first_prefill,
                     "time_generate": self.time_last_token - self.time_first_token,
-                    "cached_pages": self.cached_pages,
-                    "cached_tokens": self.cached_pages * page_size + self.cached_tokens,
+                    "cached_pages": self.cached_pages // len(self.sequences),
+                    "cached_tokens": (self.cached_pages * page_size + self.cached_tokens) // len(self.sequences),
                 })
                 if self.generator.draft_model or self.generator.use_ngram_draft:
                     r.update({
@@ -2218,8 +2220,9 @@ class ExLlamaV2DynamicJob:
                         if match > best_match:
                             best_match = match
                             best_match_page = page
-                    if best_match_page:
+                    if best_match_page and best_match > 1:
                         page = seq.allocated_pages[p0]
+                        # print([sap.page_index for sap in seq.allocated_pages])
                         for c in [self.generator.cache] if not self.generator.draft_model else \
                             [self.generator.cache, self.generator.draft_cache]:
                             c.copy_states(

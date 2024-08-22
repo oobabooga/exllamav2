@@ -3,6 +3,7 @@ import torch
 from torch import nn
 from exllamav2.module import ExLlamaV2Module
 from exllamav2.ext import exllamav2_ext as ext_c
+from exllamav2.compat import safe_move_tensor
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -12,13 +13,18 @@ class ExLlamaV2RMSNorm(ExLlamaV2Module):
 
     name: str = "RMSNorm"
 
-    weight: nn.Parameter | None
-    bias: nn.Parameter | None
+    weight: nn.Parameter | None | list[nn.Parameter | None]
+    bias: nn.Parameter | None | list[nn.Parameter | None]
     variance_epsilon: float
 
+    is_tp: bool
+    broadcast_type: int | None
 
     def __init__(self, model, key):
         super().__init__(model, key)
+
+        self.is_tp = False
+        self.broadcast_type = None
 
         self.weight = None
         self.bias = None
@@ -26,7 +32,7 @@ class ExLlamaV2RMSNorm(ExLlamaV2Module):
 
 
     @torch.inference_mode
-    def load(self):
+    def load(self, device_context = True):
 
         w = self.load_weight()
 
@@ -90,15 +96,34 @@ class ExLlamaV2RMSNorm(ExLlamaV2Module):
         return 0
 
 
-    def forward(self,
-                hidden_states: torch.Tensor,
-                cache = None,
-                attn_params = None,
-                past_len = None,
-                intermediates: bool = False,
-                loras = None,
-                output_fp32 = False,
-                **kwargs) -> torch.Tensor | dict[str: torch.Tensor]:
+    def scratch_space_tp(self) -> list[int]:
+
+        return [0] * self.model.tp_context.num_devices
+
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache = None,
+        attn_params = None,
+        past_len = None,
+        intermediates: bool = False,
+        loras = None,
+        output_fp32 = False,
+        **kwargs
+    ) -> torch.Tensor | dict[str: torch.Tensor]:
+
+        if self.is_tp:
+            return self.forward_tp(
+                hidden_states,
+                cache,
+                attn_params,
+                past_len,
+                intermediates,
+                loras,
+                output_fp32,
+                **kwargs
+            )
 
         output_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -117,15 +142,50 @@ class ExLlamaV2RMSNorm(ExLlamaV2Module):
             return hidden_states
 
 
-    def forward_torch(self,
-                      hidden_states: torch.Tensor,
-                      cache = None,
-                      attn_params = None,
-                      past_len = None,
-                      intermediates: bool = False,
-                      loras = None,
-                      output_fp32 = False,
-                      **kwargs) -> torch.Tensor | dict[str: torch.Tensor]:
+    def forward_tp(
+        self,
+        hidden_states: torch.Tensor,
+        cache = None,
+        attn_params = None,
+        past_len = None,
+        intermediates: bool = False,
+        loras = None,
+        output_fp32 = False,
+        **kwargs
+    ) -> torch.Tensor | dict[str: torch.Tensor]:
+
+        if isinstance(hidden_states, torch.Tensor):
+            output_shape = hidden_states.shape
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+            hidden_states = self.model.tp_context.broadcast(0, hidden_states, self.broadcast_type)
+        else:
+            output_shape = hidden_states[0].shape
+            hidden_states = [hs.view(-1, hs.shape[-1]) for hs in hidden_states]
+
+        outputs = [torch.empty_like(hs) for hs in hidden_states]
+        ext_c.rms_norm_tp(
+            hidden_states,
+            self.weight,
+            outputs,
+            self.variance_epsilon,
+            self.model.tp_context.ext_tp_context
+        )
+
+        outputs = [x.view(output_shape) for x in outputs]
+        return outputs
+
+
+    def forward_torch(
+        self,
+        hidden_states: torch.Tensor,
+        cache = None,
+        attn_params = None,
+        past_len = None,
+        intermediates: bool = False,
+        loras = None,
+        output_fp32 = False,
+        **kwargs
+    ) -> torch.Tensor | dict[str: torch.Tensor]:
 
         # hidden_states.clamp_(-65504.0, 65504.0)
 
@@ -143,3 +203,32 @@ class ExLlamaV2RMSNorm(ExLlamaV2Module):
             return hidden_states
 
 
+    def tp_split(self, broadcast_type: int):
+
+        cfg = self.model.config
+        self.broadcast_type = broadcast_type
+        split = self.model.tp_context.get_split(broadcast_type)
+        maxdev = max(dev for dev, _, _ in split)
+
+        new_weight = []
+        new_bias = []
+
+        for idx, a, b in split:
+            s = b - a
+            if s == 0: continue
+
+            if self.weight is not None:
+                if self.weight.device.index == idx:
+                    new_weight.append(self.weight.data)
+                else:
+                    new_weight.append(safe_move_tensor(self.weight, idx))
+
+            if self.bias is not None:
+                if self.bias.device.index == idx:
+                    new_bias.append(self.bias.data)
+                else:
+                    new_bias.append(safe_move_tensor(self.bias, idx))
+
+        self.weight = new_weight
+        self.bias = new_bias
+        self.is_tp = True
