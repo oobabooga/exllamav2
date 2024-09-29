@@ -1989,6 +1989,7 @@ class ExLlamaV2DynamicJob:
             return emit(results, emit_eos = True, eos_reason = "stop_token", stop_token = next_token.item())
 
         # Stop if we reach max_new_tokens
+        # TODO: Auto-extend option
 
         if self.new_tokens >= self.max_new_tokens - self.generator.num_draft_tokens:
             return emit(results, emit_eos = True, emit_held = True, eos_reason = "max_new_tokens")
@@ -2000,12 +2001,12 @@ class ExLlamaV2DynamicJob:
 
         # Hold text if it contains an incomplete character
 
-        if self.held_text.endswith("�") and not self.held_text.endswith("�����"):
+        if 1 <= self.held_text.count("�") < 5:
             test_decode = self.generator.tokenizer.decode(
                 self.held_tokens.torch(),
                 decode_special_tokens = self.decode_special_tokens
             )[0]
-            if not test_decode.endswith("�"):
+            if not "�" in test_decode:
                 self.held_text = test_decode
             else:
                 return emit(results)

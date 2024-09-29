@@ -10,7 +10,7 @@
 
 #include "ext_quant.h"
 #include "ext_sampling.h"
-#include "ext_safetensors.h"
+#include "ext_stloader.h"
 #include "ext_qmatrix.h"
 #include "ext_qattn.h"
 #include "ext_qmlp.h"
@@ -45,16 +45,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dump_profile_results", &dump_profile_results, "dump_profile_results");
     m.def("partial_strings_match", &partial_strings_match, "partial_strings_match");
 
-    // safetensors
+    // safetensors/stloader
 
-    m.def("safetensors_open", &safetensors_open, "safetensors_open");
-    m.def("safetensors_open_fb", &safetensors_open_fb, "safetensors_open_fb");
-    m.def("safetensors_close", &safetensors_close, "safetensors_close");
-    m.def("safetensors_close_fb", &safetensors_close_fb, "safetensors_close_fb");
-    m.def("safetensors_load", &safetensors_load, "safetensors_load");
-    m.def("safetensors_pinned_buffer", &safetensors_pinned_buffer, "safetensors_pinned_buffer");
-    m.def("safetensors_free_pinned_buffer", &safetensors_free_pinned_buffer, "safetensors_free_pinned_buffer");
-    m.def("safetensors_read_fb", &safetensors_read_fb, "safetensors_read_fb");
+    m.def("stloader_read", &stloader_read, "stloader_read");
     m.def("tensor_remap", &tensor_remap, "tensor_remap");
     m.def("tensor_remap_4bit", &tensor_remap_4bit, "tensor_remap_4bit");
 
@@ -68,6 +61,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gemm_half_q_half_tp", &gemm_half_q_half_tp, "gemm_half_q_half_tp");
     m.def("matrix_fp16_to_q4", &matrix_fp16_to_q4, "matrix_fp16_to_q4");
     m.def("matrix_q4_to_fp16", &matrix_q4_to_fp16, "matrix_q4_to_fp16");
+    m.def("make_group_map", &make_group_map, "make_group_map");
 
     // qattn
 

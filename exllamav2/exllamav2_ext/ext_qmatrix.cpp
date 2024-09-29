@@ -80,8 +80,12 @@ uintptr_t make_q_matrix
         TORCH_CHECK(temp_dq.size(0) >= dq_req, "Insufficient size of temp_dq buffer")
     }
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(q_weight));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
     QMatrix* m = new QMatrix
     (
+        stream,
         device,
         height,
         width,
@@ -149,8 +153,12 @@ uintptr_t make_q_matrix_split
         TORCH_CHECK(false, "Tensor split not implemented for GPTQ matrices");
     }
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(q_weight));
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
     QMatrix* m = new QMatrix
     (
+        stream,
         device,
         height,
         width,
@@ -328,4 +336,26 @@ void matrix_fp16_to_q4
         (half*) scales.data_ptr(),
         numel
     );
+}
+
+torch::Tensor make_group_map(torch::Tensor& q_groups, int num_qrows)
+{
+    TORCH_CHECK_DTYPE(q_groups, kShort);
+    int num_groups = q_groups.size(0) / 2;
+    int16_t* gr = (int16_t*) q_groups.data_ptr();
+
+    std::vector<int16_t> group_map;
+    for (int i = 0; i < num_groups; ++i)
+    {
+        int bits = gr[i * 2];
+        int qrows = i < num_groups - 1 ? gr[i * 2 + 3] - gr[i * 2 + 1] : num_qrows - gr[i * 2 + 1];
+        int rows = (qrows * 32) / bits;
+        for (int j = 0; j < rows; ++j)
+        {
+            group_map.push_back(i);
+            group_map.push_back(rows - j);
+        }
+    }
+
+    return torch::tensor(group_map, torch::kShort);
 }

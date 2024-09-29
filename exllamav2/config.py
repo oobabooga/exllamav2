@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 import math
-from exllamav2.fasttensors import STFile, cleanup_stfiles
+from exllamav2.stloader import STFile, cleanup_stfiles
 from exllamav2.architecture import ExLlamaV2ArchParams
 import os, glob, json
 from typing import Any, Dict, List, TypeVar, Union, cast
@@ -61,7 +61,6 @@ class ExLlamaV2Config:
     no_flash_attn: bool                         # Implementation will automatically use flash-attn-2 when available, set True to override
     no_xformers: bool                           # Implementation will automatically use xformers for sm<80 when available, unless flash-attn-2 is available, set True to override
     no_sdpa: bool                               # Do not use Torch SDPA even if causal_lower_right bias is available (seems to be unreliable on ROCm (?))
-    fasttensors: bool                           # Use alternative .safetensors loader (aio on Linux, cstdio on Windows). Not always faster but can address excessive use of system RAM in some situations
     load_in_q4: bool                            # Load float linear layers in Q4 format (for test/dev purposes, not performant)
     no_graphs: bool                             # Do not use CUDA graphs
 
@@ -112,8 +111,14 @@ class ExLlamaV2Config:
     l3_rope_low_freq_factor: float | None
     l3_rope_high_freq_factor: float | None
     l3_rope_original_max_position_embeddings: int | None
+    yarn_rope_factor: float | None
+    yarn_rope_original_max_position_embeddings: int | None
     checkpoint_fused_mlp: bool
     checkpoint_offset_qzeros: bool
+
+    # Deprecated fields, kept for compatibiltiy
+
+    fasttensors: bool                           # Fasttensors loader removed in v0.2.3
 
 
     def __init__(self,
@@ -136,7 +141,6 @@ class ExLlamaV2Config:
         self.no_flash_attn = 'EXLLAMA_NO_FLASH_ATTN' in os.environ
         self.no_xformers = 'EXLLAMA_NO_XFORMERS' in os.environ
         self.no_sdpa = 'EXLLAMA_NO_SDPA' in os.environ
-        self.fasttensors = 'EXLLAMA_FASTTENSORS' in os.environ
         self.load_in_q4 = False
         self.no_graphs = 'EXLLAMA_NO_GRAPHS' in os.environ
 
@@ -283,21 +287,24 @@ class ExLlamaV2Config:
         rs = read(read_config, dict, "rope_scaling", None)
         if rs:
             scaling_type = rs.get("type", None)
+            rope_type = rs.get("rope_type", None)
+            assert not (scaling_type and rope_type), "rope_scaling key has both `type` and `rope_type` subkeys"
             if scaling_type == "linear":
                 assert "factor" in rs, "'factor' missing from 'rope_scaling' config"
                 self.scale_pos_emb = rs.get("factor", 1.0)
             if scaling_type == "su" or scaling_type == "longrope":
-                assert "long_factor" in rs, "'long_factor' missing from 'rope_scaling' config"
-                assert "short_factor" in rs, "'short_factor' missing from 'rope_scaling' config"
+                assert "long_factor" in rs, "'long_factor' missing from 'rope_scaling' config ('su' mode)"
+                assert "short_factor" in rs, "'short_factor' missing from 'rope_scaling' config ('su' mode)"
                 assert "original_max_position_embeddings" in read_config, \
                     "'original_max_position_embeddings' required for 'su' scaling"
                 self.scale_long_factor = rs["long_factor"]
                 self.scale_short_factor = rs["short_factor"]
                 self.original_max_seq_len = read_config["original_max_position_embeddings"]
                 self.alt_rope_method = "su"
-            # if scaling_type == "yarn":
-            #     self.scale_alpha_value = factor
-            rope_type = rs.get("rope_type", None)
+            if scaling_type == "yarn":
+                self.alt_rope_method = "yarn"
+                self.yarn_rope_factor = rs["factor"]
+                self.yarn_rope_original_max_position_embeddings = rs["original_max_position_embeddings"]
             if rope_type == "llama3":
                 self.alt_rope_method = "llama3"
                 self.l3_rope_factor = rs["factor"]
@@ -323,7 +330,7 @@ class ExLlamaV2Config:
             raise ValueError(f" ## No .safetensors files found in {self.model_dir}")
 
         for st_file in self.tensor_files:
-            f = STFile.open(st_file, fast = self.fasttensors, keymap = self.arch.keymap)
+            f = STFile.open(st_file, keymap = self.arch.keymap)
             for key in f.get_dict():
                 self.tensor_file_map[key] = st_file
 

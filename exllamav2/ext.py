@@ -6,6 +6,7 @@ import sys
 import platform
 import threading
 from exllamav2.util import get_basic_progress
+from exllamav2.compat import safe_move_tensor
 
 extension_name = "exllamav2_ext"
 verbose = False  # Print wall of text when compiling
@@ -213,7 +214,7 @@ if build_jit:
         "ext_qmlp.cpp",
         "ext_quant.cpp",
         "ext_rope.cpp",
-        "ext_safetensors.cpp",
+        "ext_stloader.cpp",
         "ext_sampling.cpp",
         "ext_element.cpp",
         "ext_tp.cpp",
@@ -250,7 +251,6 @@ if build_jit:
         "cpp/generator.cpp",
         "cpp/sampling.cpp",
         "cpp/sampling_avx2.cpp",
-        "cpp/safetensors.cpp"
     ]
 
     sources = [os.path.join(sources_dir, s) for s in sources_]
@@ -298,13 +298,11 @@ none_tensor = torch.empty((1, 1), device = "meta")
 
 # Group map needed for irregular group sizes
 
-def make_group_map(q_groups: torch.Tensor, num_qrows: int) -> torch.Tensor:
-
+def make_group_map_py(q_groups: torch.Tensor, num_qrows: int) -> torch.Tensor:
     gr = q_groups.tolist()
     group_map = []
     num_groups = len(gr) // 2
     row = 0
-
     for i in range(num_groups):
         bits = gr[i * 2]
         if i < num_groups - 1:
@@ -315,8 +313,11 @@ def make_group_map(q_groups: torch.Tensor, num_qrows: int) -> torch.Tensor:
         for j in range(rows):
             group_map += [i]
             group_map += [rows - j]
-
     return torch.tensor(group_map, dtype = torch.short, device = q_groups.device)
+
+def make_group_map(q_groups: torch.Tensor, num_qrows: int) -> torch.Tensor:
+    group_map = ext_c.make_group_map(q_groups.cpu(), num_qrows)
+    return safe_move_tensor(group_map, q_groups.device)
 
 
 # Create Q matrix

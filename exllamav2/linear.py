@@ -9,6 +9,7 @@ from exllamav2.compat import safe_move_tensor
 from exllamav2.tensor_p import BROADCAST_VC
 from exllamav2.util import unpack_4bit, pack_4bit
 import gc
+from exllamav2.experimental.fpx import fpxify
 
 from typing import TYPE_CHECKING
 
@@ -170,6 +171,7 @@ class ExLlamaV2Linear(ExLlamaV2Module):
 
         elif isinstance(w, nn.Parameter):
             assert not self.has_bias, self.key + " has no bias tensor but bias is expected"
+            # w = nn.Parameter(fpxify(w.data, 2, 3), requires_grad = False)
             if self.normalize_unq:
                 w = self.normalize(w)
             if self.padding > 0: w = nn.Parameter(F.pad(w.data, (0, 0, 0, self.padding)).contiguous())
@@ -188,6 +190,7 @@ class ExLlamaV2Linear(ExLlamaV2Module):
             if self.normalize_unq:
                 w = self.normalize(w[0]), w[1]
             ww = w[0]
+            # ww = nn.Parameter(fpxify(ww.data, 2, 3), requires_grad = False)
             wb = w[1]
             if self.padding > 0:
                 ww = nn.Parameter(F.pad(ww.data, (0, 0, 0, self.padding)).contiguous())
@@ -560,16 +563,16 @@ class ExLlamaV2Linear(ExLlamaV2Module):
 
             w = {
                 "q_scale": safe_move_tensor(self.q_tensors["q_scale"][:, a // 8:b // 8], idx).contiguous(),
-                "q_scale_max": safe_move_tensor(self.q_tensors["q_scale_max"], idx).contiguous(),
-                "q_group_map": safe_move_tensor(self.q_tensors["q_group_map"], idx).contiguous(),
-                "q_groups": safe_move_tensor(self.q_tensors["q_groups"], idx).contiguous(),
+                "q_scale_max": safe_move_tensor(self.q_tensors["q_scale_max"], idx),
+                "q_group_map": safe_move_tensor(self.q_tensors["q_group_map"], idx),
+                "q_groups": safe_move_tensor(self.q_tensors["q_groups"], idx),
                 "q_weight": safe_move_tensor(self.q_tensors["q_weight"][:, a:b], idx).contiguous()
             }
 
             if "q_perm" in self.q_tensors:
                 w.update({
-                    "q_perm": safe_move_tensor(self.q_tensors["q_perm"], idx).contiguous(),
-                    "q_invperm": safe_move_tensor(self.q_tensors["q_invperm"], idx).contiguous(),
+                    "q_perm": safe_move_tensor(self.q_tensors["q_perm"], idx),
+                    "q_invperm": safe_move_tensor(self.q_tensors["q_invperm"], idx),
                 })
 
             if "bias" in self.q_tensors:

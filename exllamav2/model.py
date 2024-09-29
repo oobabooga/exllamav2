@@ -46,7 +46,7 @@ from exllamav2.parallel_decoder import ExLlamaV2ParallelDecoder
 from exllamav2.embedding import ExLlamaV2Embedding
 from exllamav2.pos_embedding import ExLlamaV2PosEmbedding
 from exllamav2.compat import safe_move_tensor
-from exllamav2.fasttensors import cleanup_stfiles
+from exllamav2.stloader import cleanup_stfiles
 from exllamav2.device import ExLlamaV2DeviceContext, set_device_streams
 from exllamav2.tensor_p import TPContext, BROADCAST_VC
 import gc
@@ -299,6 +299,7 @@ class ExLlamaV2:
         callback_gen: Callable[[int, int], None] | None = None
     ):
         with torch.inference_mode():
+            set_device_streams()
 
             stats_ = self.set_device_map(gpu_split or [99999])
 
@@ -406,6 +407,7 @@ class ExLlamaV2:
         # Load module weights
 
         with torch.inference_mode():
+            set_device_streams()
 
             for idx in range(len(self.modules)):
                 module = self.modules[idx]
@@ -514,6 +516,7 @@ class ExLlamaV2:
         loras = None  # TODO: Autosplit load with LoRAs
 
         with torch.inference_mode():
+            set_device_streams()
 
             self.device_context = []
 
@@ -578,7 +581,11 @@ class ExLlamaV2:
 
                     module.set_device_idx(current_device)
 
-                    hidden_state_backup = safe_move_tensor(hidden_state, "cpu").clone()
+                    hidden_state_backup = hidden_state
+                    # if hidden_state.device == "cpu":
+                    #     hidden_state_backup = hidden_state.clone()
+                    # else:
+                    #     hidden_state_backup = safe_move_tensor(hidden_state, "cpu").clone()
 
                     try:
                         if isinstance(module, ExLlamaV2Attention) or \
