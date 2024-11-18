@@ -14,3 +14,6 @@ from exllamav2.lora import ExLlamaV2Lora
 from exllamav2.util import SeqTensor
 from exllamav2.util import Timer
 from exllamav2.module import Intervention
+
+from exllamav2.vlm.mmprojector import ExLlamaV2MultimodalProjector
+from exllamav2.vlm.vision_tower import ExLlamaV2VisionTower

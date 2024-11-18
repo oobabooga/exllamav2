@@ -3,10 +3,11 @@ from __future__ import annotations
 from exllamav2 import ExLlamaV2, ExLlamaV2Tokenizer, SeqTensor, ExLlamaV2Lora
 from exllamav2.generator import ExLlamaV2Sampler
 from exllamav2.generator.filters import ExLlamaV2Filter
+from exllamav2.generator.dynamic_embeddings import ExLlamaV2MMEmbedding
 from exllamav2.cache import ExLlamaV2CacheBase, ExLlamaV2Cache_8bit
 from exllamav2.attn import ExLlamaV2Attention, assert_paged_attn
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
-from exllamav2.util import cuda_sync_active
+from exllamav2.util import cuda_sync_active, timed
 from concurrent.futures import ThreadPoolExecutor
 
 from exllamav2.compat import pairwise
@@ -525,7 +526,7 @@ class ExLlamaV2DynamicGenerator:
             self.current_loras = loras
         else:
             self.current_loras = [loras]
-        
+
 
     def generate(
         self,
@@ -544,6 +545,7 @@ class ExLlamaV2DynamicGenerator:
         filters: list[list[ExLlamaV2Filter]] | list[ExLlamaV2Filter] | None = None,
         filter_prefer_eos: bool = False,
         return_last_results: bool = False,
+        embeddings: list[ExLlamaV2MMEmbedding] | list[list[ExLlamaV2MMEmbedding]] | None = None,
         **kwargs
     ):
         """
@@ -602,6 +604,9 @@ class ExLlamaV2DynamicGenerator:
         :param return_last_results:
             If True, returns the last results dict for each job
 
+        :param embeddings:
+            Optional list of ExLlamaV2MMEmbeddings to use for, or list of lists for batched generation
+
         :return:
             Completion(s): (str or list[str] depending on the type of the input prompt argument)
             Optionally, last results: (dict or list[dict] depending on the type of the input prompt argument)
@@ -613,27 +618,44 @@ class ExLlamaV2DynamicGenerator:
         else:
             prompts = [prompt]
             filters = [filters]
+            embeddings = [embeddings]
 
-        if filters is None:
+        if not filters:
             filters = [None] * len(prompts)
         else:
             assert len(filters) == len(prompts) and \
                 all((f is None or isinstance(f, list)) for f in filters), \
                 "If using filters, must provide one filter list (or None-value) per prompt."
 
+        if not embeddings:
+            embeddings = [None] * len(prompts)
+        else:
+            assert len(embeddings) == len(prompts) and all((isinstance(f, list) or not f) for f in embeddings), \
+                "Must provide one list of embeddings per prompt."
+
         prompts = prompt if isinstance(prompt, list) else [prompt]
         batch_size = len(prompts)
         for idx, p in enumerate(prompts):
 
             if isinstance(p, str):
-                input_ids = self.tokenizer.encode(p, encode_special_tokens = encode_special_tokens, add_bos = add_bos)
+                input_ids = self.tokenizer.encode(
+                    p,
+                    encode_special_tokens = encode_special_tokens,
+                    add_bos = add_bos,
+                    embeddings = embeddings[idx]
+                )
             elif isinstance(p, tuple):
-                input_ids = [self.tokenizer.encode(p_, encode_special_tokens = encode_special_tokens, add_bos = add_bos) for p_ in p]
+                input_ids = [self.tokenizer.encode(
+                    p_,
+                    encode_special_tokens = encode_special_tokens,
+                    add_bos = add_bos,
+                    embeddings = embeddings[idx]
+                ) for p_ in p]
             else:
                 assert False, "Unexpected type in prompt"
 
             if gen_settings is None:
-                p_settings = ExLlamaV2Sampler.Settings()
+                p_settings = None
             elif isinstance(gen_settings, ExLlamaV2Sampler.Settings):
                 p_settings = gen_settings
             elif isinstance(gen_settings, list):
@@ -653,6 +675,7 @@ class ExLlamaV2DynamicGenerator:
                 filter_prefer_eos = filter_prefer_eos,
                 token_healing = token_healing,
                 decode_special_tokens = decode_special_tokens,
+                embeddings = embeddings[idx] or []
             )
 
             if seed is not None: seed += 1
@@ -667,6 +690,7 @@ class ExLlamaV2DynamicGenerator:
 
         while self.num_remaining_jobs():
             results = self.iterate()
+
             for r in results:
                 idx = order[r["serial"]]
                 if r["stage"] == "streaming":
@@ -1044,6 +1068,12 @@ class ExLlamaV2DynamicGenerator:
         batch_ids = self.draft_input_ids_pinned[:batch_size, :]
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
 
+        # Indexed embeddings not supported when drafting
+
+        for job in self.active_jobs:
+            assert not job.embeddings, \
+                "Embeddings not supported while using draft model."
+
         # Greedy sample draft IDs
 
         for idx in range(self.num_draft_tokens):
@@ -1106,9 +1136,10 @@ class ExLlamaV2DynamicGenerator:
                 cache_seqlens[batch] = seq.kv_position
                 batch += 1
 
-        # Collect input IDs
+        # Collect input IDs and indexed embeddings
 
         input_ids_list = []
+        active_embeddings = []
         logit_mapping = []
         for job in self.active_jobs:
             logit_mapping.append(len(input_ids_list))
@@ -1121,6 +1152,7 @@ class ExLlamaV2DynamicGenerator:
             else:
                 job_ids = job.get_input_ids_list(draft_tokens, len(input_ids_list), add_to_cache = True)
             input_ids_list += job_ids
+            active_embeddings += job.embeddings
 
         logit_mapping.append(len(input_ids_list))
 
@@ -1135,14 +1167,18 @@ class ExLlamaV2DynamicGenerator:
             attn_params = attn_params,
             cache = self.cache,
             loras = self.current_loras,
+            indexed_embeddings = active_embeddings
         )["logits"]
 
         # GPU workload is scheduled here, so launch any sampling filters that can run while waiting for CUDA
 
         if self.filter_queue:
-            for f in self.filter_queue:
-                f.background_next(self.filter_pool)
-            time.sleep(0)
+            for f, p in self.filter_queue:
+                if p:
+                    f.background_prepare_logit_mask(self.filter_pool)
+                else:
+                    f.background_next(self.filter_pool)
+            # time.sleep(0)
             self.filter_queue.clear()
 
         # Pass logits to jobs for sampling
@@ -1489,6 +1525,10 @@ class ExLlamaV2DynamicJob:
     banned_strings_utf32_offsets: np.array or None
     checkpoint: dict | None
 
+    # Hold reference to embeddings
+
+    embeddings: list[ExLlamaV2MMEmbedding]
+
 
     def __init__(
         self,
@@ -1496,7 +1536,7 @@ class ExLlamaV2DynamicJob:
         max_new_tokens: int,
         min_new_tokens: int = 0,
         max_skips: int | None = 4,
-        gen_settings: ExLlamaV2Sampler.Settings = ExLlamaV2Sampler.Settings(),
+        gen_settings: ExLlamaV2Sampler.Settings | None = None,
         seed: int = None,
         stop_conditions: list | tuple | set = None,
         decode_special_tokens: bool = False,
@@ -1508,6 +1548,7 @@ class ExLlamaV2DynamicJob:
         token_healing: bool = False,
         identifier: object | None = None,
         banned_strings: list[str] | None = None,
+        embeddings: list[ExLlamaV2MMEmbedding] | None = None,
         **kwargs
     ):
         """
@@ -1572,6 +1613,9 @@ class ExLlamaV2DynamicJob:
         :param identifier:
             Object to return with every stream event relating to this job
 
+        :param embeddings:
+            Optional list of ExLlamaV2MMEmbeddings to use for, or list of lists for batched generation
+
         :param kwargs:
         """
 
@@ -1584,6 +1628,9 @@ class ExLlamaV2DynamicJob:
 
         self.max_skips = max_skips
         self.allocated_pages = None
+
+        if gen_settings is None:
+            gen_settings = ExLlamaV2Sampler.Settings()
 
         # Prepare sequences
 
@@ -1684,6 +1731,10 @@ class ExLlamaV2DynamicJob:
 
         self.filters = filters if filters is not None else []
         self.filter_prefer_eos = filter_prefer_eos
+
+        # Embeddings
+
+        self.embeddings = embeddings or []
 
 
     def __repr__(self):
@@ -1795,11 +1846,20 @@ class ExLlamaV2DynamicJob:
         # Feed filters
 
         if self.new_tokens >= 0:
+            all_mask = True
             for f in self.filters:
                 f.feed(next_token)
-                # Evaluate filter in background when possible
-                if f.use_background_worker():
-                    self.generator.filter_queue.append(f)
+                if not f.can_mask_logits() or not f.use_background_worker():
+                    all_mask = False
+            if all_mask:
+                # Using logit mask(s)
+                for f in self.filters:
+                    self.generator.filter_queue.append((f, True))
+            else:
+                # Using allowed token list(s)
+                for f in self.filters:
+                    if f.use_background_worker():
+                        self.generator.filter_queue.append((f, False))
 
         # Accept token
 
@@ -2321,6 +2381,7 @@ class ExLlamaV2DynamicJob:
                     attn_params = attn_params,
                     cache = self.generator.cache,
                     loras = self.generator.current_loras,
+                    indexed_embeddings = self.embeddings
                 )
 
                 seq.kv_position = prefill_end

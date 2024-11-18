@@ -10,11 +10,20 @@ from typing import Any, Dict, List, TypeVar, Union, cast
 T = TypeVar('T')
 no_default = object()
 
-def read(input_dict: dict[str, Any], expected_type: type | list[type], keys: str | list[str], default = no_default) -> T:
+def read(
+    input_dict: dict[str, Any],
+    expected_type: type | list[type],
+    keys: str | list[str],
+    default = no_default,
+    opt_subkey: str | None = None
+) -> T:
 
     expected_types = expected_type if isinstance(expected_type, list) else [expected_type]
 
     if isinstance(keys, str): keys = [keys]
+
+    if opt_subkey is not None:
+        keys = keys + [opt_subkey + "->" + k for k in keys]
 
     for key in keys:
         input_dict_s = input_dict
@@ -116,6 +125,25 @@ class ExLlamaV2Config:
     checkpoint_fused_mlp: bool
     checkpoint_offset_qzeros: bool
 
+    vision_model_type: str | None
+    vision_head_dim: int | None
+    vision_num_attention_heads: int | None
+    vision_num_key_value_heads: int | None
+    vision_num_key_value_groups: int | None
+    vision_hidden_size: int | None
+    vision_intermediate_size: int | None
+    vision_hidden_act: int | None
+    vision_rope_theta: float | None
+    vision_feature_layer: int | None
+    vision_patch_size: dict | None
+    vision_image_mean: list | None
+    vision_image_std: list | None
+    vision_resample: int | None
+    vision_rescale_factor: float | None
+    vision_size: dict | None
+    vision_num_channels: int | None
+    vision_num_layers: int | None
+
     # Deprecated fields, kept for compatibiltiy
 
     fasttensors: bool                           # Fasttensors loader removed in v0.2.3
@@ -204,36 +232,51 @@ class ExLlamaV2Config:
         self.bos_token_id = read(read_config, int, "bos_token_id", None)  # 1
         self.eos_token_id = read(read_config, [int, list], "eos_token_id", None)  # 2
         self.pad_token_id = read(read_config, int, "pad_token_id", None)  # 0
-        self.vocab_size = read(read_config, int, "vocab_size")
+        self.vocab_size = read(read_config, int, "vocab_size", opt_subkey = "text_config")
 
         if isinstance(self.eos_token_id, list):
             self.eos_token_id = self.eos_token_id[0]  # TODO: Figure out a way to maybe use all the EOS tokens somehow
 
         # Standard params
 
-        self.initializer_range = read(read_config, float, ["initializer_range"])
-        self.num_hidden_layers = read(read_config, int, ["num_hidden_layers", "n_layers", "n_layer"])
+        self.initializer_range = read(read_config, float, ["initializer_range"], 0.02)
+        self.num_hidden_layers = read(read_config, int, ["num_hidden_layers", "n_layers", "n_layer"], opt_subkey = "text_config")
 
         # Norm params
 
-        if self.arch.norm_eps_key:
-            self.norm_eps = read(read_config, float, self.arch.norm_eps_key)
+        if self.arch.lm.keys["norm_eps"]:
+            self.norm_eps = read(read_config, float, self.arch.lm.keys["norm_eps"], opt_subkey = "text_config")
         else:
             self.norm_eps = 1e-5  # Torch default
 
         # Model dimensions
 
-        self.hidden_size = read(read_config, int, ["hidden_size", "d_model", "n_embd"])
+        self.hidden_size = read(read_config, int, ["hidden_size", "d_model", "n_embd"], opt_subkey = "text_config")
 
         # Attn params
 
-        self.num_attention_heads = read(read_config, int, ["num_attention_heads", "n_heads", "n_head"])
-        self.head_dim = read(read_config, int, "head_dim", self.hidden_size // self.num_attention_heads)
+        self.num_attention_heads = read(read_config, int, ["num_attention_heads", "n_heads", "n_head"], 0, opt_subkey = "text_config")
+        self.head_dim = read(
+            read_config,
+            int,
+            "head_dim",
+            (self.hidden_size // self.num_attention_heads) if self.num_attention_heads else no_default,
+            opt_subkey = "text_config"
+        )
 
-        if self.arch.mqa:
+        if not self.num_attention_heads:
+            self.num_attention_heads = self.hidden_size // self.head_dim
+
+        if self.arch.lm.mqa:
             self.num_key_value_heads = 1
         else:
-            self.num_key_value_heads = read(read_config, int, ["num_key_value_heads", "attn_config->kv_n_heads"], self.num_attention_heads)
+            self.num_key_value_heads = read(
+                read_config,
+                int,
+                ["num_key_value_heads", "attn_config->kv_n_heads"],
+                self.num_attention_heads,
+                opt_subkey = "text_config",
+            )
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
         self.use_qk_norm = read(read_config, bool, ["use_qk_norm"], False)
 
@@ -241,19 +284,25 @@ class ExLlamaV2Config:
 
         # MLP params
 
-        if self.arch.default_inner_dim_mult is not None:
-            default_intermediate_size = self.arch.default_inner_dim_mult * self.hidden_size
+        if self.arch.lm.default_inner_dim_mult is not None:
+            default_intermediate_size = self.arch.lm.default_inner_dim_mult * self.hidden_size
         else:
             default_intermediate_size = no_default
 
-        self.intermediate_size = read(read_config, int, ["intermediate_size", "ffn_config->ffn_hidden_size", "n_inner"], default_intermediate_size)
+        self.intermediate_size = read(
+            read_config,
+            int,
+            ["intermediate_size", "ffn_config->ffn_hidden_size", "n_inner"],
+            default_intermediate_size,
+            opt_subkey = "text_config",
+        )
         self.num_experts = read(read_config, int, ["num_local_experts", "ffn_config->moe_num_experts"], None)
         self.num_experts_per_token = read(read_config, int,["num_experts_per_tok", "ffn_config->moe_top_k"], None)
 
         # Logit/embedding/residual scale
 
         self.logit_scale = read(read_config, float, "logit_scale", 1)
-        if self.arch.logit_scale_basedim:
+        if self.arch.lm.logit_scale_basedim:
             dim_model_base = read(read_config, int, "dim_model_base", self.hidden_size)
             self.logit_scale /= (self.hidden_size / dim_model_base)
 
@@ -273,16 +322,24 @@ class ExLlamaV2Config:
 
         # Positional embeddings
 
-        self.rotary_embedding_base = read(read_config, float, ["rope_theta", "attn_config->rope_theta"], 10000.0)
+        self.rotary_embedding_base = read(
+            read_config,
+            float,
+            ["rope_theta", "attn_config->rope_theta"],
+            10000.0,
+            opt_subkey = "text_config",
+        )
 
-        self.max_seq_len = read(read_config, int,["max_sequence_length",
-                                                  "model_max_length",
-                                                  "max_position_embeddings",
-                                                  "max_seq_len",
-                                                  "n_positions"], 2048)
+        self.max_seq_len = read(
+            read_config,
+            int,
+            ["max_sequence_length", "model_max_length", "max_position_embeddings", "max_seq_len", "n_positions"],
+            2048,
+            opt_subkey = "text_config"
+        )
         self.original_max_seq_len = self.max_seq_len
 
-        self.sliding_window = read(read_config, int, ["sliding_window", "sliding_window_size"], 0)
+        self.sliding_window = read(read_config, int, ["sliding_window", "sliding_window_size"], 0, opt_subkey = "text_config")
 
         rs = read(read_config, dict, "rope_scaling", None)
         if rs:
@@ -345,37 +402,94 @@ class ExLlamaV2Config:
 
         # Make sure we found all the layers we need
 
-        expect_keys = self.arch.expect_keys.copy()
+        def check_keys(archparams, prefix):
 
-        if not self.num_experts or self.num_experts == 1:
-            per_layer_keys = self.arch.layer_keys
-        else:
-            per_layer_keys = set()
-            for expert_idx in range(self.num_experts):
-                for k in self.arch.layer_keys:
-                    skt = [sk.replace(".*.", f".{expert_idx}.") for sk in k]
-                    per_layer_keys.add(tuple(skt))
-            per_layer_keys = list(per_layer_keys)
+            expect_keys = archparams.expect_keys.copy()
 
-        for layer_idx in range(self.num_hidden_layers):
-            for ks in per_layer_keys:
-                prefixes = [f"model.layers.{layer_idx}.{k}" for k in ks]
-                expect_keys.append(prefixes)
+            if not self.num_experts or self.num_experts == 1:
+                per_layer_keys = archparams.layer_keys
+            else:
+                per_layer_keys = set()
+                for expert_idx in range(self.num_experts):
+                    for k in archparams.layer_keys:
+                        skt = [sk.replace(".*.", f".{expert_idx}.") for sk in k]
+                        per_layer_keys.add(tuple(skt))
+                per_layer_keys = list(per_layer_keys)
 
-        all_keys = set(self.tensor_file_map.keys())
-        suffixes = [".q_weight", ".qweight", ".weight", ""]
+            for layer_idx in range(self.num_hidden_layers):
+                for ks in per_layer_keys:
+                    prefixes = [f"model.layers.{layer_idx}.{k}" for k in ks]
+                    expect_keys.append(prefixes)
 
-        for prefixes in expect_keys:
-            match = False
-            for prefix in prefixes:
-                for suffix in suffixes:
-                    if (prefix + suffix) in all_keys:
-                        match = True
-                        break
+            if self.arch.lm_prefix:
+                expect_keys = [
+                    [prefix + k for k in k2]
+                    for k2 in expect_keys
+                ]
+
+            all_keys = set(self.tensor_file_map.keys())
+            suffixes = [".q_weight", ".qweight", ".weight", ""]
+
+            for prefixes in expect_keys:
+                match = False
+                for prefix in prefixes:
+                    for suffix in suffixes:
+                        if (prefix + suffix) in all_keys:
+                            match = True
+                            break
+                        if match: break
                     if match: break
-                if match: break
-            if not match:
-                raise ValueError(f" ## Could not find {prefix}.* in model")
+                if not match:
+                    raise ValueError(f" ## Could not find {prefix}.* in model")
+
+        check_keys(self.arch.lm, self.arch.lm_prefix)
+        check_keys(self.arch.mmp, self.arch.mmp_prefix)
+        check_keys(self.arch.vt, self.arch.vt_prefix)
+
+        # Vision models
+
+        self.vision_model_type = read(read_config, str, "vision_config->model_type", None)
+
+        if self.vision_model_type:
+            self.model_config = os.path.join(self.model_dir, "preprocessor_config.json")
+            assert os.path.exists(self.model_config), "Can't find " + self.model_config
+            with open(self.model_config, encoding = "utf8") as f:
+                read_prep_config = json.load(f)
+
+        if self.vision_model_type is None:
+            pass
+
+        elif self.vision_model_type == "pixtral":
+            self.vision_head_dim = read(read_config, int, ["vision_config->head_dim"], no_default)
+            self.vision_num_attention_heads = read(read_config, int, ["vision_config->num_attention_heads"], no_default)
+            self.vision_num_key_value_heads = read(read_config, int, ["vision_config->num_key_value_heads"], self.vision_num_attention_heads)
+            self.vision_num_key_value_groups = self.vision_num_attention_heads // self.vision_num_key_value_heads
+
+            self.vision_hidden_act = read(read_config, str, ["vision_config->hidden_act"], no_default)
+            self.vision_hidden_size = read(read_config, int, ["vision_config->image_size"], no_default)
+            patch_size = read(read_config, int, ["vision_config->patch_size"], no_default)
+            self.vision_rope_theta = read(read_config, int, ["vision_config->rope_theta"], no_default)
+            self.vision_feature_layer = read(read_config, int, ["vision_feature_layer"], no_default)
+            self.vision_num_layers = 24
+            self.vision_intermediate_size = read(read_config, int, ["vision_config->intermediate_size"], self.vision_hidden_size * 4)
+
+            image_processor_type = read(read_prep_config, str, ["image_processor_type"], no_default)
+            assert image_processor_type == "PixtralImageProcessor", \
+                f"Wrong image processor type: {image_processor_type}"
+            self.vision_image_mean = read(read_prep_config, list, ["image_mean"], no_default)
+            self.vision_image_std = read(read_prep_config, list, ["image_std"], no_default)
+            self.vision_patch_size = read(read_prep_config, dict, ["patch_size"], no_default)
+            assert all(self.vision_patch_size.get(x) == patch_size for x in ["width", "height"]), \
+                "Patch size inconsistency between config.json and preprocessor_config.json"
+            self.vision_resample = read(read_prep_config, int, ["resample"], no_default)
+            self.vision_rescale_factor = read(read_prep_config, float, ["rescale_factor"], no_default)
+            self.vision_size = read(read_prep_config, dict, ["size"], no_default)
+            self.vision_num_channels = 3
+
+        else:
+            raise ValueError(f"Unsupported vision model type: {self.vision_model_type}")
+
+        # Cleanup
 
         cleanup_stfiles()
 
@@ -391,7 +505,7 @@ class ExLlamaV2Config:
 
         warnings = []
 
-        if self.arch.eager_attn_only:
+        if self.arch.lm.eager_attn_only:
             warnings.append(" !! Warning: Architecture currently supports only eager attention")
             if not warn_only:
                 warnings.append(" !! Warning: flash-attn, xformers and SDPA are disabled")
@@ -406,7 +520,7 @@ class ExLlamaV2Config:
             if self.attn_logit_softcapping and not has_flash_attn_with_softcap:
                 warnings.append(" !! Warning: model requires softcap, not supported in installed version of flash-attn")
                 disable = True
-            if (self.arch.swa or self.arch.alternating_swa) and not has_flash_attn_with_window:
+            if (self.arch.lm.swa or self.arch.lm.alternating_swa) and not has_flash_attn_with_window:
                 warnings.append(" !! Warning: model requires SWA, not supported in installed version of flash-attn")
                 disable = True
             if disable and not warn_only:
@@ -418,7 +532,7 @@ class ExLlamaV2Config:
             if self.attn_logit_softcapping:
                 warnings.append(" !! Warning: model requires softcap, not supported in xformers")
                 disable = True
-            if self.arch.swa or self.arch.alternating_swa:
+            if self.arch.lm.swa or self.arch.lm.alternating_swa:
                 warnings.append(" !! Warning: model requires SWA, not supported in xformers")
                 disable = True
             if disable and not warn_only:

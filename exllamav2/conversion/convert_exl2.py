@@ -67,8 +67,13 @@ if args.bits < 2 or args.bits > 8:
     print(f" !! Warning: target bitrate {args.bits} will likely not be attainable")
 
 if not os.path.exists(args.out_dir):
-    print(f" ## Error: Directory not found: {args.out_dir}")
-    sys.exit()
+    try:
+        os.makedirs(args.out_dir, exist_ok=True)
+        print(f" -- Created output directory: {args.out_dir}")
+    except OSError as e:
+        print(f" ## Error: Failed to create output directory: {args.out_dir}")
+        print(f"    {str(e)}")
+        sys.exit()
 
 # Create job
 
@@ -144,7 +149,7 @@ else:
         sys.exit()
 
     if job["progress"] == "finished":
-        print(" !! Job is already finished")
+        print(f" !! Job is already finished. Clear the working directory, or run this script with -nr/--no_resume to clear it automatically.")
         sys.exit()
 
 # Feedback
@@ -203,7 +208,7 @@ model.load(lazy = True)
 
 # Limit context length if necessary
 
-if model.config.arch.rope_style == RopeStyle.NONE:
+if model.config.arch.lm.rope_style == RopeStyle.NONE:
     max_ctx = model.config.max_seq_len
     if job["length"] > max_ctx:
         print (f" !! Warning: Reducing calibration length to model max context: {max_ctx}")
