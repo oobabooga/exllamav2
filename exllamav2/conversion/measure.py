@@ -80,7 +80,7 @@ def embeddings(job, save_fn, model, measure = False):
 
     module.load()
     input_ids[input_ids >= module.native_vocab_size] = 0
-    hidden_state = module.forward(input_ids)
+    hidden_state = module.forward(input_ids, negative_ids_noise = True)
     module.unload()
 
     embeddings_dict = { f"row.{i:05}": hidden_state[i:i+1, :, :].contiguous() for i in range(hidden_state.shape[0]) }
@@ -131,7 +131,8 @@ def test_error(module, hidden_states, target_states, cache, attn_params):
         x = x.cuda()
         xref = xref.cuda()
         xtest = module.forward(x, cache, attn_params)
-        xtest.clamp_(-65504, 65504)
+        if not module.model.config.arch.lm.residual_stream_fp32:
+            xtest.clamp_(-65504, 65504)
         xtest = xtest[0].float()
         xref = xref[0].float()
         rfn_sum += torch.linalg.norm(xtest - xref, 'fro') / torch.linalg.norm(xref, 'fro')

@@ -139,6 +139,8 @@ class ExLlamaV2ArchParams:
                 "attn_k": ".self_attn.k_proj",
                 "attn_v": ".self_attn.v_proj",
                 "attn_o": ".self_attn.o_proj",
+                "layers": "layers",
+                "patch_conv": "patch_conv",
             })
 
             # Compute logit scale from `dim_model_base` key in config.json (MiniCPM quirk)
@@ -211,6 +213,10 @@ class ExLlamaV2ArchParams:
             # Vision stuff
             patch_conv_bias: bool = False
             is_vision: bool = False
+            vision_input_norm: bool = True
+            vision_conv3d: bool = False
+            mrope: bool = False
+            rope_freq_half: bool = False
 
         # Component models
         self.lm_prefix = ""
@@ -234,6 +240,9 @@ class ExLlamaV2ArchParams:
 
         # Tensors are transposed in original model weights
         self.orig_weights_transposed = False
+
+        # Add noise rows to calibration while quantizing
+        self.standard_calib_noise = None
 
         # Mistral
 
@@ -292,6 +301,7 @@ class ExLlamaV2ArchParams:
                 "mlp_down": ".feed_forward.down_proj",
                 "norm_1": ".attention_norm",
                 "norm_2": ".ffn_norm",
+                "layers": "transformer.layers",
             })
 
             self.mmp_prefix = "multi_modal_projector."
@@ -331,7 +341,7 @@ class ExLlamaV2ArchParams:
                 expect_keys_llama
             self.lm.norm = "layernorm"
 
-        # Qwen2 (1.5)
+        # Qwen2 (1.5, 2, 2.5)
 
         if arch_string == "Qwen2ForCausalLM":
             arch_recognized = True
@@ -343,6 +353,54 @@ class ExLlamaV2ArchParams:
                 expect_keys_llama
             self.lm.attention_bias_qkv = True
             self.lm.supports_tp = True
+
+        # Qwen2-VL (2, 2.5)
+
+        if arch_string == "Qwen2VLForConditionalGeneration":
+            arch_recognized = True
+            self.lm.layer_keys += \
+                layer_keys_llama_norms + \
+                layer_keys_llama_attn + \
+                layer_keys_llama_mlp
+            self.lm.expect_keys += \
+                expect_keys_llama
+            self.lm.attention_bias_qkv = True
+            self.lm.mrope = True
+            self.lm.rope_freq_half = True
+
+            read_config["vision_config"].update({"model_type": "qwen2"})
+            self.vt_prefix = "visual."
+            self.vt.keys.update({
+                "fused_qkv": ".attn.qkv",
+                "attn_o": ".attn.proj",
+                "mlp_gate": None,
+                "mlp_up": ".mlp.fc1",
+                "mlp_down": ".mlp.fc2",
+                "norm_1": ".norm1",
+                "norm_2": ".norm2",
+                "layers": "blocks",
+                "patch_conv": "patch_embed.proj",
+            })
+            self.vt.mlp_gate = False
+            self.vt.mlp_bias = True
+            self.vt.attention_bias_qkv = True
+            self.vt.attention_bias_o = True
+            self.vt.vision_input_norm = False
+            self.vt.vision_conv3d = True
+            self.vt.mlp_act_func = "quickgelu"
+            self.vt.norm = "layernorm"
+
+            self.mmp_prefix = "visual.merger."
+            self.mmp.keys.update({
+                "mlp_gate": None,
+                "mlp_up": "mlp.0",
+                "mlp_down": "mlp.2",
+                "norm_2": "ln_q",
+            })
+            self.mmp.mlp_gate = False
+            self.mmp.mlp_act_func = "gelu"
+            self.mmp.mlp_bias = True
+            self.mmp.norm = "layernorm"
 
         # Gemma
 

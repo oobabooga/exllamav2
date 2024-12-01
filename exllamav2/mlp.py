@@ -36,6 +36,7 @@ class ExLlamaV2MLP(ExLlamaV2Module):
 
     is_tp: bool
     tp_dq_size: list[int] | None
+    merge: int | None
 
 
     def __init__(
@@ -49,6 +50,7 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         in_features: int | None = None,
         out_features: int | None = None,
         interm_features: int | None = None,
+        merge: int | None = None,
     ):
         super().__init__(model, key, archparams)
         cfg = self.model.config
@@ -68,6 +70,7 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         self.in_features = in_features
         self.out_features = out_features
         self.interm_features = interm_features
+        self.merge = merge
 
         self.is_tp = False
         self.tp_dq_size = None
@@ -253,7 +256,6 @@ class ExLlamaV2MLP(ExLlamaV2Module):
 
     def scratch_space(self) -> int:
 
-        assert self.interm_features >= self.in_features and self.interm_features >= self.out_features
         return (
             self.temp_state_size() +
             self.temp_a_size() +
@@ -270,14 +272,16 @@ class ExLlamaV2MLP(ExLlamaV2Module):
 
     def temp_a_size(self) -> int:
 
+        temp = max(self.in_features, self.interm_features, self.out_features)
         cfg = self.model.config
-        return cfg.max_input_len * cfg.max_batch_size * self.interm_features * 2 + 128
+        return cfg.max_input_len * cfg.max_batch_size * temp * 2 + 128
 
 
     def temp_b_size(self) -> int:
 
+        temp = max(self.in_features, self.interm_features, self.out_features)
         cfg = self.model.config
-        return cfg.max_input_len * cfg.max_batch_size * self.interm_features * 2 + 128
+        return cfg.max_input_len * cfg.max_batch_size * temp * 2 + 128
 
 
     def temp_dq_size(self) -> int:
@@ -452,6 +456,11 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         post_norm = self.pre_layernorm.forward(hidden_states) \
             if self.pre_layernorm else hidden_states
 
+        if self.merge:
+            bd = post_norm.shape[:-2]
+            l, d = post_norm.shape[-2:]
+            post_norm = post_norm.view(*bd, l // self.merge, d * self.merge)
+
         if self.gate_proj is not None:
             gate = self.gate_proj.forward(post_norm, loras = loras)
             if self.archparams.mlp_act_func == "silu":
@@ -467,6 +476,8 @@ class ExLlamaV2MLP(ExLlamaV2Module):
                 y = F.silu(up)
             elif self.archparams.mlp_act_func == "gelu":
                 y = F.gelu(up, approximate = "tanh")
+            elif self.archparams.mlp_act_func == "quickgelu":
+                y = up * torch.sigmoid(1.702 * up)
 
         down = self.down_proj.forward(y, loras = loras)
         if self.post_layernorm:

@@ -5,19 +5,20 @@ import threading
 
 import torch
 from exllamav2 import ExLlamaV2, ExLlamaV2Tokenizer
-from exllamav2.conv2d import ExLlamaV2Conv2D
+from exllamav2.conv import ExLlamaV2Conv
 from exllamav2.rmsnorm import ExLlamaV2RMSNorm
 from exllamav2.attn import ExLlamaV2Attention
 from exllamav2.mlp import ExLlamaV2MLP
 from exllamav2.config import ExLlamaV2Config
 from exllamav2.module import ExLlamaV2Module
-from exllamav2.vlm.processor import pixtral
 from exllamav2.compat import safe_move_tensor
 from exllamav2.generator import ExLlamaV2MMEmbedding
-from typing import Callable
+
+from exllamav2.vlm.processor import pixtral, qwen2
 
 from PIL.Image import Image
-from exllamav2.vlm.util import position_ids_in_meshgrid
+
+import math
 
 class ExLlamaV2VisionTower(ExLlamaV2):
 
@@ -32,6 +33,7 @@ class ExLlamaV2VisionTower(ExLlamaV2):
         self.config = config
         cfg = self.config
         self.archparams = cfg.arch.vt
+        km = self.archparams.keys
         self.modules = []
 
         # Preprocessor
@@ -39,35 +41,67 @@ class ExLlamaV2VisionTower(ExLlamaV2):
         if cfg.vision_model_type == "pixtral":
             self.preprocess_func = pixtral.preprocess
             self.postprocess_func = pixtral.postprocess
+        elif cfg.vision_model_type == "qwen2":
+            self.preprocess_func = qwen2.preprocess
+            self.postprocess_func = qwen2.postprocess
+
         else:
             raise ValueError(f"Unknown vision model type: {cfg.vision_model_type}")
 
         # Position embeddings
 
-        self.p_maxedge = cfg.vision_size["longest_edge"] // cfg.vision_patch_size["width"]
-        freqs = 1.0 / (cfg.vision_rope_theta ** (torch.arange(0, cfg.vision_head_dim, 2).float() / cfg.vision_head_dim))
-        h = torch.arange(self.p_maxedge, device=freqs.device)
-        w = torch.arange(self.p_maxedge, device=freqs.device)
-        freqs_h = torch.outer(h, freqs[::2]).float()
-        freqs_w = torch.outer(w, freqs[1::2]).float()
-        inv_freq = torch.cat(
-            [
-                freqs_h[:, None, :].repeat(1, self.p_maxedge, 1),
-                freqs_w[None, :, :].repeat(self.p_maxedge, 1, 1),
-            ],
-            dim=-1,
-        ).reshape(-1, cfg.vision_head_dim // 2)
-        inv_freq = torch.cat((inv_freq, inv_freq), dim = -1)
+        if cfg.vision_model_type == "pixtral":
+            self.p_maxedge = cfg.vision_size["longest_edge"] // cfg.vision_patch_size["width"]
+            freqs = 1.0 / (cfg.vision_rope_theta ** (torch.arange(0, cfg.vision_head_dim, 2).float() / cfg.vision_head_dim))
+            h = torch.arange(self.p_maxedge, device = freqs.device)
+            w = torch.arange(self.p_maxedge, device = freqs.device)
+            freqs_h = torch.outer(h, freqs[::2]).float()
+            freqs_w = torch.outer(w, freqs[1::2]).float()
+            inv_freq = torch.cat(
+                [
+                    freqs_h[:, None, :].repeat(1, self.p_maxedge, 1),
+                    freqs_w[None, :, :].repeat(self.p_maxedge, 1, 1),
+                ],
+                dim = -1,
+            ).reshape(-1, cfg.vision_head_dim // 2)
+            inv_freq = torch.cat((inv_freq, inv_freq), dim = -1)
 
-        self.rope_cos = inv_freq.cos().half()
-        self.rope_sin = inv_freq.sin().half()
+            self.rope_cos = inv_freq.cos().half()
+            self.rope_sin = inv_freq.sin().half()
+
+            self.position_emb_func = pixtral.position_embeddings
+
+        elif cfg.vision_model_type == "qwen2":
+            self.p_maxedge = cfg.vision_max_size
+            dim = cfg.vision_head_dim // 2
+            max_seqlen = int(math.ceil(cfg.vision_max_size / cfg.vision_spatial_patch_size))
+            inv_freq = 1.0 / (cfg.vision_rope_theta ** (torch.arange(0, dim, 2).float() / dim)).half()
+            s = torch.arange(max_seqlen, dtype = inv_freq.dtype).half()
+            inv_freq = torch.outer(s, inv_freq)
+            # inv_freq = torch.cat((inv_freq, inv_freq), dim = -1)
+
+            self.rope_cos = inv_freq.cos().half()
+            self.rope_sin = inv_freq.sin().half()
+
+            self.position_emb_func = qwen2.position_embeddings
 
         # Patch embeddings
 
-        patch_size = tuple(config.vision_patch_size[x] for x in ["height", "width"])
-        patch_conv = ExLlamaV2Conv2D(
+        if cfg.arch.vt.vision_conv3d:
+            patch_size = (
+                config.vision_temporal_patch_size,
+                config.vision_patch_size["height"],
+                config.vision_patch_size["width"],
+            )
+        else:
+            patch_size = (
+                config.vision_patch_size["height"],
+                config.vision_patch_size["width"],
+            )
+
+        patch_conv = ExLlamaV2Conv(
             model = self,
-            key = cfg.arch.vt_prefix + "patch_conv",
+            key = cfg.arch.vt_prefix + km["patch_conv"],
             in_channels = self.config.vision_num_channels,
             out_channels = self.config.vision_hidden_size,
             kernel_size = patch_size,
@@ -78,33 +112,36 @@ class ExLlamaV2VisionTower(ExLlamaV2):
 
         # Input norm
 
-        norm = ExLlamaV2RMSNorm(
-            model = self,
-            key = cfg.arch.vt_prefix + "ln_pre",
-            archparams = self.archparams,
-        )
-        self.modules += [norm]
+        if self.archparams.vision_input_norm:
+            norm = ExLlamaV2RMSNorm(
+                model = self,
+                key = cfg.arch.vt_prefix + "ln_pre",
+                archparams = self.archparams,
+            )
+            self.modules += [norm]
 
         # Decoder layers
 
         for layer_idx in range(self.config.vision_num_layers):
-            layer_key = cfg.arch.vt_prefix + f"transformer.layers.{layer_idx}"
+            layer_key = cfg.arch.vt_prefix + km["layers"] + f".{layer_idx}"
             attn = ExLlamaV2Attention(self, layer_key, layer_idx, archparams = self.archparams)
             mlp = ExLlamaV2MLP(self, layer_key, layer_idx, archparams = self.archparams)
             self.modules += [attn, mlp]
 
         # Multimodal projection
 
+        merge = cfg.vision_spatial_merge_size ** 2
         mmp = ExLlamaV2MLP(
             self,
             cfg.arch.mmp_prefix,
             0,
             archparams = cfg.arch.mmp,
-            in_features = cfg.vision_hidden_size,
+            in_features = cfg.vision_hidden_size * merge,
             out_features = cfg.hidden_size,
-            interm_features = cfg.hidden_size,
-            has_norm = False,
-            has_residual = False
+            interm_features = cfg.vision_intermediate_size,
+            has_norm = True,
+            has_residual = False,
+            merge = merge,
         )
         self.modules += [mmp]
 
@@ -126,22 +163,34 @@ class ExLlamaV2VisionTower(ExLlamaV2):
     def process(
         self,
         hidden_states: torch.Tensor,
+        patches_size = None,
         abort_event: threading.Event | None = None,
         **kwargs
     ):
         cfg = self.config
 
+        if len(hidden_states.shape) == 2:
+            hidden_states = hidden_states.unsqueeze(0)
         if len(hidden_states.shape) == 3:
             hidden_states = hidden_states.unsqueeze(0)
 
         bsz, channels, height, width = hidden_states.shape
 
-        p_height = height // cfg.vision_patch_size["height"]
-        p_width = width // cfg.vision_patch_size["width"]
-        position_ids = position_ids_in_meshgrid(p_height, p_width, self.p_maxedge)
+        if patches_size is None:
+            p_height = height // cfg.vision_patch_size["height"]
+            p_width = width // cfg.vision_patch_size["width"]
+        else:
+            p_height, p_width = patches_size
 
-        cos = self.rope_cos[position_ids]
-        sin = self.rope_sin[position_ids]
+        sin, cos = self.position_emb_func(
+            self.config,
+            p_height,
+            p_width,
+            self.p_maxedge,
+            self.rope_sin,
+            self.rope_cos
+        )
+
         attn_params = ExLlamaV2Attention.Params(non_causal_attn = True)
 
         device = self.modules[0].device_idx
@@ -178,7 +227,8 @@ class ExLlamaV2VisionTower(ExLlamaV2):
         model: ExLlamaV2,
         tokenizer: ExLlamaV2Tokenizer,
         image: Image,
-        text_alias: str,
+        text_alias: str | None = None,
+        embeddings_cpu: bool = True
     ) -> ExLlamaV2MMEmbedding:
         """
         :param model:
@@ -193,6 +243,12 @@ class ExLlamaV2VisionTower(ExLlamaV2):
         :param text_alias:
             Text string to represent this embedding for tokenizing
 
+        :param embeddings_cpu:
+            Move embeddings to CPU. This can be skipped for simple jobs, but ideally embeddings should be cached
+            when used with the dynamic generator, and it is not ideal to keep some large cache of data in VRAM. The
+            overhead of copying them back to VRAM is relatively low. If this argument is False, embeddings will
+            reside on whatever device the vision tower is loaded on.
+
         :return:
             ExLlamaV2MMEmbedding
         """
@@ -200,15 +256,23 @@ class ExLlamaV2VisionTower(ExLlamaV2):
         width, height = image.size
         original_size = (height, width)
 
-        image_tensor = self.preprocess_func(self.config, image)
-        image_size = tuple(image_tensor.shape[1:])
+        maxsize = self.config.vision_max_size
+        assert all(s <= maxsize for s in original_size), \
+            f"Input image exceeds maximum size of {maxsize} x {maxsize}"
 
-        embedding_tensor = self.process(image_tensor)
+        image_tensor, prep_image_size = self.preprocess_func(self.config, image)
+        features_x = prep_image_size[0] // self.config.vision_patch_size["width"]
+        features_y = prep_image_size[1] // self.config.vision_patch_size["height"]
 
-        features_y = image_size[0] // 16
-        features_x = image_size[1] // 16
+        embedding_tensor = self.process(
+            image_tensor,
+            (features_y, features_x)
+        )
 
-        embedding_tensor = self.postprocess_func(
+        if embeddings_cpu:
+            embedding_tensor = embedding_tensor.cpu()
+
+        embedding_tensor, pre_tokens, post_tokens = self.postprocess_func(
             model,
             tokenizer,
             embedding_tensor[0],
@@ -219,12 +283,15 @@ class ExLlamaV2VisionTower(ExLlamaV2):
         mme = ExLlamaV2MMEmbedding(
             model = model,
             embeddings = embedding_tensor,
-            text_alias = text_alias
+            text_alias = text_alias,
+            thw_grid = (1, features_y, features_x),
+            pre_tokens = pre_tokens,
+            post_tokens = post_tokens
         )
 
         mme.metadata.update({
             "original_size": original_size,
-            "preprocessed_size": image_size,
+            "preprocessed_size": prep_image_size,
             "patches_size": (features_y, features_x),
         })
 

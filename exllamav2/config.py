@@ -124,6 +124,7 @@ class ExLlamaV2Config:
     yarn_rope_original_max_position_embeddings: int | None
     checkpoint_fused_mlp: bool
     checkpoint_offset_qzeros: bool
+    mrope_section: list | None
 
     vision_model_type: str | None
     vision_head_dim: int | None
@@ -132,7 +133,7 @@ class ExLlamaV2Config:
     vision_num_key_value_groups: int | None
     vision_hidden_size: int | None
     vision_intermediate_size: int | None
-    vision_hidden_act: int | None
+    vision_hidden_act: str | None
     vision_rope_theta: float | None
     vision_feature_layer: int | None
     vision_patch_size: dict | None
@@ -143,6 +144,12 @@ class ExLlamaV2Config:
     vision_size: dict | None
     vision_num_channels: int | None
     vision_num_layers: int | None
+    vision_spatial_merge_size: int | None
+    vision_spatial_patch_size: int | None
+    vision_min_pixels: int | None
+    vision_max_pixels: int | None
+    vision_temporal_patch_size: int | None
+    vision_max_size: int | None
 
     # Deprecated fields, kept for compatibiltiy
 
@@ -368,6 +375,9 @@ class ExLlamaV2Config:
                 self.l3_rope_low_freq_factor = rs["low_freq_factor"]
                 self.l3_rope_high_freq_factor = rs["high_freq_factor"]
                 self.l3_rope_original_max_position_embeddings = rs["original_max_position_embeddings"]
+            if scaling_type == "mrope":
+                self.mrope_section = rs["mrope_section"]
+
 
         # Checkpoint format (for GPTQ models)
 
@@ -456,6 +466,8 @@ class ExLlamaV2Config:
             with open(self.model_config, encoding = "utf8") as f:
                 read_prep_config = json.load(f)
 
+        # TODO: Cleanup & refactor
+
         if self.vision_model_type is None:
             pass
 
@@ -471,7 +483,7 @@ class ExLlamaV2Config:
             self.vision_rope_theta = read(read_config, int, ["vision_config->rope_theta"], no_default)
             self.vision_feature_layer = read(read_config, int, ["vision_feature_layer"], no_default)
             self.vision_num_layers = 24
-            self.vision_intermediate_size = read(read_config, int, ["vision_config->intermediate_size"], self.vision_hidden_size * 4)
+            self.vision_intermediate_size = read(read_config, int, ["vision_config->intermediate_size"], self.hidden_size)
 
             image_processor_type = read(read_prep_config, str, ["image_processor_type"], no_default)
             assert image_processor_type == "PixtralImageProcessor", \
@@ -485,6 +497,42 @@ class ExLlamaV2Config:
             self.vision_rescale_factor = read(read_prep_config, float, ["rescale_factor"], no_default)
             self.vision_size = read(read_prep_config, dict, ["size"], no_default)
             self.vision_num_channels = 3
+            self.vision_spatial_merge_size = 1
+            self.vision_max_size = 16384
+
+        elif self.vision_model_type == "qwen2":
+            self.vision_num_attention_heads = read(read_config, int, ["vision_config->num_heads"], no_default)
+            self.vision_num_key_value_heads = self.vision_num_attention_heads
+            self.vision_hidden_size = read(read_config, int, ["vision_config->embed_dim"], no_default)
+            self.vision_head_dim = self.vision_hidden_size // self.vision_num_attention_heads
+            self.vision_num_key_value_groups = 1
+            self.vision_hidden_act = "quickgelu"
+            self.vision_spatial_merge_size = read(read_config, int, ["vision_config->spatial_merge_size"], no_default)
+            self.vision_spatial_patch_size = read(read_config, int, ["vision_config->spatial_patch_size"], no_default)
+            patch_size = read(read_config, int, ["vision_config->patch_size"], no_default)
+            self.vision_rope_theta = read(read_config, int, ["vision_config->rope_theta"], 10000.0)
+            self.vision_num_layers = read(read_config, int, ["vision_config->depth"], no_default)
+            mlp_ratio = read(read_config, int, ["vision_config->mlp_ratio"], no_default)
+            self.vision_intermediate_size = self.vision_hidden_size * mlp_ratio
+
+            image_processor_type = read(read_prep_config, str, ["image_processor_type"], no_default)
+            assert image_processor_type == "Qwen2VLImageProcessor", \
+                f"Wrong image processor type: {image_processor_type}"
+            self.vision_image_mean = read(read_prep_config, list, ["image_mean"], no_default)
+            self.vision_image_std = read(read_prep_config, list, ["image_std"], no_default)
+            assert read(read_prep_config, int, ["patch_size"], no_default) == patch_size, \
+                "Incorrect patch size in preprocessor_config.json"
+            self.vision_patch_size = {"height": patch_size, "width": patch_size}
+            self.vision_temporal_patch_size = read(read_prep_config, int, ["temporal_patch_size"], no_default)
+            self.vision_resample = 3
+            self.vision_rescale_factor = None
+            assert read(read_prep_config, int, ["merge_size"], no_default) == self.vision_spatial_merge_size, \
+                "Incorrect merge size in preprocessor_config.json"
+            self.vision_rescale_factor = read(read_prep_config, float, ["rescale_factor"], 0.00392156862745098)
+            self.vision_num_channels = 3
+            self.vision_min_pixels = read(read_prep_config, int, ["min_pixels"], no_default)
+            self.vision_max_pixels = read(read_prep_config, int, ["max_pixels"], no_default)
+            self.vision_max_size = 16384
 
         else:
             raise ValueError(f"Unsupported vision model type: {self.vision_model_type}")
