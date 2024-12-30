@@ -16,42 +16,29 @@ from exllamav2.generator import (
 )
 
 from PIL import Image
-import requests
+import requests, glob
 
 import torch
 torch.set_printoptions(precision = 5, sci_mode = False, linewidth=200)
 
-# Models used:
+# Model used:
 #
-# Pixtral:
-#   https://huggingface.co/mistral-community/pixtral-12b/
-#   https://huggingface.co/turboderp/pixtral-12b-exl2
 # Qwen2-VL:
 #   https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct
 #   https://huggingface.co/turboderp/Qwen2-VL-7B-Instruct-exl2
 
-# mode = "pixtral"
-mode = "qwen2"
-
 streaming = True
 greedy = True
 
-if mode == "pixtral":
-    model_directory = "/mnt/str/models/pixtral-12b-exl2/6.0bpw"
-elif mode == "qwen2":
-    model_directory = "/mnt/str/models/qwen2-vl-7b-instruct-exl2/6.0bpw"
+model_directory = "/mnt/str/models/qwen2-vl-7b-instruct-exl2/6.0bpw"
+images_mask = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media/test_video_*.png")
 
-images = [
-    {"file": "media/test_image_1.jpg"},
-    {"file": "media/test_image_2.jpg"},
-    # {"url": "https://media.istockphoto.com/id/1212540739/photo/mom-cat-with-kitten.jpg?s=612x612&w=0&k=20&c=RwoWm5-6iY0np7FuKWn8FTSieWxIoO917FF47LfcBKE="},
-    # {"url": "https://i.dailymail.co.uk/1s/2023/07/10/21/73050285-12283411-Which_way_should_I_go_One_lady_from_the_US_shared_this_incredibl-a-4_1689019614007.jpg"},
-    # {"url": "https://images.fineartamerica.com/images-medium-large-5/metal-household-objects-trevor-clifford-photography.jpg"}
+frames = [
+    {"file": f}
+    for f in sorted(glob.glob(images_mask))
 ]
 
-instruction = "Compare and contrast the two experiments."
-# instruction = "Describe the image."
-# instruction = "Find the alarm clock."  # Qwen2 seems to support this but unsure of how to prompt correctly
+instruction = "Describe this video."
 
 # Initialize model
 
@@ -89,50 +76,28 @@ def get_image(file = None, url = None):
     elif url:
         return Image.open(requests.get(url, stream = True).raw)
 
-# Convert image(s) to embeddings. Aliases can be given explicitly with the text_alias argument, but here we
+# Convert video to embeddings. Aliases can be given explicitly with the text_alias argument, but here we
 # use automatically assigned unique identifiers, then concatenate them into a string
 
-image_embeddings = [
-    vision_model.get_image_embeddings(
-        model = model,
-        tokenizer = tokenizer,
-        image = get_image(**img_args),
-    )
-    for img_args in images
-]
+video_embedding = vision_model.get_video_embeddings(
+    model = model,
+    tokenizer = tokenizer,
+    video = [get_image(**img_args) for img_args in frames],
+)
+video_embeddings = [video_embedding]
 
-placeholders = "\n".join([ie.text_alias for ie in image_embeddings]) + "\n"
+# Define prompt
 
-# Define a prompt using the aliases above as placeholders for image tokens. The tokenizer will replace each alias
-# with a range of temporary token IDs, and the model will embed those temporary IDs from their respective sources
-# rather than the model's text embedding table.
-#
-# The temporary IDs are unique for the lifetime of the process and persist as long as a reference is held to the
-# corresponding ExLlamaV2Embedding object. This way, images can be reused between generations, or used multiple
-# for multiple jobs in a batch, and the generator will be able to apply prompt caching and deduplication to image
-# tokens as well as text tokens.
-#
-# Image token IDs are assigned sequentially, however, so two ExLlamaV2Embedding objects created from the same
-# source image will not be recognized as the same image for purposes of prompt caching etc.
-
-if mode == "pixtral":
-    prompt = (
-        "[INST]" +
-        placeholders +
-        instruction +
-        "[/INST]"
-    )
-
-elif mode == "qwen2":
-    prompt = (
+prompt = (
         "<|im_start|>system\n" +
         "You are a helpful assistant.<|im_end|>\n" +
         "<|im_start|>user\n" +
-        placeholders +
+        video_embedding.text_alias +
+        # "\n" +
         instruction +
         "<|im_end|>\n" +
         "<|im_start|>assistant\n"
-    )
+)
 
 # Generate
 
@@ -140,9 +105,9 @@ if streaming:
 
     input_ids = tokenizer.encode(
         prompt,
-        add_bos = True,
+        # add_bos = True,
         encode_special_tokens = True,
-        embeddings = image_embeddings,
+        embeddings = video_embeddings,
     )
 
     job = ExLlamaV2DynamicJob(
@@ -151,7 +116,7 @@ if streaming:
         decode_special_tokens = True,
         stop_conditions = [tokenizer.eos_token_id],
         gen_settings = ExLlamaV2Sampler.Settings.greedy() if greedy else None,
-        embeddings = image_embeddings,
+        embeddings = video_embeddings,
     )
 
     generator.enqueue(job)
@@ -178,7 +143,7 @@ else:
         decode_special_tokens = True,
         stop_conditions = [tokenizer.eos_token_id],
         gen_settings = ExLlamaV2Sampler.Settings.greedy() if greedy else None,
-        embeddings = image_embeddings,
+        embeddings = video_embeddings,
     )
 
     print(output)

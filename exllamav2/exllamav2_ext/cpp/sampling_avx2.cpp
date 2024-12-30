@@ -9,8 +9,10 @@
 #include <chrono>
 #include <map>
 #include "avx2_target.h"
-#include "avx_mathfun.h"
 #include "profiling.h"
+
+#ifdef USE_AVX2
+#include "avx_mathfun.h"
 
 AVX2_TARGET
 int softmax_cpu_avx2
@@ -141,4 +143,24 @@ int softmax_cpu_avx2
 //    }
 //    printf("sum: %f\n\n", summ);
     return maxi;
+
 }
+
+#else
+
+// Dummy function to avoid compilation errors on aarch64
+
+int softmax_cpu_avx2
+(
+    const int vocab_size,
+    const float temperature,
+    const float* logits,
+    const bool* logits_filter,
+    const float exponent,
+    float* output
+)
+{
+    return 0;
+}
+
+#endif

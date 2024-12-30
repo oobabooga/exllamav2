@@ -115,6 +115,7 @@ class ExLlamaV2Config:
     final_logit_softcapping: float | None
     attn_logit_softcapping: float | None
     sliding_window: int
+    sliding_window_pattern: int
     norm_head: int | None
     l3_rope_factor: float | None
     l3_rope_low_freq_factor: float | None
@@ -125,6 +126,7 @@ class ExLlamaV2Config:
     checkpoint_fused_mlp: bool
     checkpoint_offset_qzeros: bool
     mrope_section: list | None
+    attention_multiplier: float | None
 
     vision_model_type: str | None
     vision_head_dim: int | None
@@ -288,6 +290,7 @@ class ExLlamaV2Config:
         self.use_qk_norm = read(read_config, bool, ["use_qk_norm"], False)
 
         self.query_pre_attn_scalar = read(read_config, float, "query_pre_attn_scalar", None)
+        self.attention_multiplier = read(read_config, float, "attention_multiplier", None)
 
         # MLP params
 
@@ -313,11 +316,17 @@ class ExLlamaV2Config:
             dim_model_base = read(read_config, int, "dim_model_base", self.hidden_size)
             self.logit_scale /= (self.hidden_size / dim_model_base)
 
-        self.scale_emb = read(read_config, float, "scale_emb", 1)
+        logit_scaling = read(read_config, float, "logits_scaling", None)  # Granite is backwards
+        if logit_scaling:
+            self.logit_scale = 1.0 / logit_scaling
+
+        self.scale_emb = read(read_config, float, ["scale_emb", "embedding_multiplier"], 1)
+        residual_multiplier = read(read_config, float, "residual_multiplier", None)
         scale_depth = read(read_config, float, "scale_depth", None)
-        if scale_depth is None:
-            self.scale_depth = 1
-        else:
+        self.scale_depth = 1
+        if residual_multiplier:
+            self.scale_depth = residual_multiplier
+        elif scale_depth:
             self.scale_depth = scale_depth / math.sqrt(self.num_hidden_layers)
 
         self.attn_logit_softcapping = read(read_config, float, "attn_logit_softcapping", None)
@@ -347,6 +356,7 @@ class ExLlamaV2Config:
         self.original_max_seq_len = self.max_seq_len
 
         self.sliding_window = read(read_config, int, ["sliding_window", "sliding_window_size"], 0, opt_subkey = "text_config")
+        self.sliding_window_pattern = read(read_config, int, ["sliding_window_pattern"], 1)
 
         rs = read(read_config, dict, "rope_scaling", None)
         if rs:
@@ -476,13 +486,14 @@ class ExLlamaV2Config:
             self.vision_num_attention_heads = read(read_config, int, ["vision_config->num_attention_heads"], no_default)
             self.vision_num_key_value_heads = read(read_config, int, ["vision_config->num_key_value_heads"], self.vision_num_attention_heads)
             self.vision_num_key_value_groups = self.vision_num_attention_heads // self.vision_num_key_value_heads
+            self.multimodal_projector_bias = read(read_config, bool, ["multimodal_projector_bias"], True)
 
             self.vision_hidden_act = read(read_config, str, ["vision_config->hidden_act"], no_default)
-            self.vision_hidden_size = read(read_config, int, ["vision_config->image_size"], no_default)
+            self.vision_hidden_size = read(read_config, int, ["vision_config->hidden_size"], 1024)
             patch_size = read(read_config, int, ["vision_config->patch_size"], no_default)
             self.vision_rope_theta = read(read_config, int, ["vision_config->rope_theta"], no_default)
             self.vision_feature_layer = read(read_config, int, ["vision_feature_layer"], no_default)
-            self.vision_num_layers = 24
+            self.vision_num_layers = read(read_config, int, ["vision_config->num_hidden_layers"], 24)
             self.vision_intermediate_size = read(read_config, int, ["vision_config->intermediate_size"], self.hidden_size)
 
             image_processor_type = read(read_prep_config, str, ["image_processor_type"], no_default)

@@ -15,6 +15,8 @@ def get_rope_params_su(
 ):
     head_dim = cfg.head_dim
     base = cfg.rotary_embedding_base
+    if cfg.scale_alpha_value and cfg.scale_alpha_value != 1.0:
+        base *= cfg.scale_alpha_value ** (cfg.head_dim / (cfg.head_dim - 2))
 
     a = cfg.max_seq_len
     b = cfg.original_max_seq_len
@@ -23,10 +25,10 @@ def get_rope_params_su(
         scaling_factor = math.sqrt(1 + math.log(a / b) / math.log(b))
     else:
         ext_factors = torch.tensor(cfg.scale_short_factor, dtype = torch.float32, device = device)
+        scaling_factor = 1.0
 
     inv_freq = 1.0 / (ext_factors * base ** (torch.arange(0, head_dim, 2, device = device).float() / head_dim))
     return inv_freq, scaling_factor
-
 
 # Llama 3.1
 
@@ -36,6 +38,8 @@ def get_rope_params_llama3(
 ):
     head_dim = cfg.head_dim
     base = cfg.rotary_embedding_base
+    if cfg.scale_alpha_value and cfg.scale_alpha_value != 1.0:
+        base *= cfg.scale_alpha_value ** (cfg.head_dim / (cfg.head_dim - 2))
 
     def apply_scaling(
         freqs: torch.Tensor,
@@ -79,6 +83,9 @@ def get_rope_params_yarn(
 ):
     head_dim = cfg.head_dim
     base = cfg.rotary_embedding_base
+    if cfg.scale_alpha_value and cfg.scale_alpha_value != 1.0:
+        base *= cfg.scale_alpha_value ** (cfg.head_dim / (cfg.head_dim - 2))
+
     yarn_max_position_embeddings = cfg.max_seq_len
 
     # Only activate if longer than original ctx
@@ -133,6 +140,7 @@ def get_rope_params_yarn(
         )
     else:
         inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+        scaling_factor = 1.0
 
     return inv_freq, scaling_factor
 
@@ -144,6 +152,8 @@ def get_rope_params_default(
 ):
     head_dim = cfg.head_dim
     base = cfg.rotary_embedding_base
+    if cfg.scale_alpha_value and cfg.scale_alpha_value != 1.0:
+        base *= cfg.scale_alpha_value ** (cfg.head_dim / (cfg.head_dim - 2))
 
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device = device).float() / head_dim))
     return inv_freq, 1.0
