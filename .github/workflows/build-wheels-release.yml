@@ -62,9 +62,9 @@ jobs:
 
       # Setup Python
 
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v3
+      - uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.pyver }}
 
@@ -199,13 +199,13 @@ jobs:
 
       # Upload files
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: matrix.artname == 'wheel'
         with:
           name: 'wheel'
           path: ./dist/*
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: matrix.artname == 'sdist'
         with:
           name: 'sdist'
