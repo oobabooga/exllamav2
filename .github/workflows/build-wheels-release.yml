@@ -204,12 +204,14 @@ jobs:
         with:
           name: 'wheel'
           path: ./dist/*
+          overwrite: true
 
       - uses: actions/upload-artifact@v4
         if: matrix.artname == 'sdist'
         with:
           name: 'sdist'
           path: ./dist/*
+          overwrite: true
 
       - name: Upload files to GitHub release
         if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
