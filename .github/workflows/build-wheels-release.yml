@@ -20,23 +20,17 @@ jobs:
       matrix:
         include:
 
-        # Ubuntu 20.04 CUDA
-         - { artname: 'wheel', os: ubuntu-20.04, pyver: '3.10', cuda: '12.1.0', rocm:    '', torch: '2.4.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
-         - { artname: 'wheel', os: ubuntu-20.04, pyver: '3.11', cuda: '12.1.0', rocm:    '', torch: '2.4.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
-        
+        # Ubuntu 22.04 CUDA
+         - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.4.1', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+
         # Windows 2022 CUDA
-         - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.1.0', rocm:    '', torch: '2.4.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
-         - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.1.0', rocm:    '', torch: '2.4.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
-        
-        # Ubuntu 20.04 ROCm
-         - { artname: 'wheel', os: ubuntu-20.04, pyver: '3.10', cuda: '',       rocm: '6.1', torch: '2.4.1', cudaarch: ''                                    }
-         - { artname: 'wheel', os: ubuntu-20.04, pyver: '3.11', cuda: '',       rocm: '6.1', torch: '2.4.1', cudaarch: ''                                    }
+         - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.4.1', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+
+        # Ubuntu 22.04 ROCm
+         - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm: '6.1', torch: '2.6.0', cudaarch: ''                                    }
 
          # sdist
-         - { artname: 'sdist', os: ubuntu-20.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.4.1', cudaarch: ''                                    }
-
-         # Extra wheel for HF spaces
-         - { artname: 'wheel', os: ubuntu-20.04, pyver: '3.10', cuda: '12.1.0', rocm:    '', torch: '2.4.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+         - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.6.0', cudaarch: ''                                    }
 
     defaults:
       run:
@@ -68,9 +62,9 @@ jobs:
 
       - name: Get version string
         id: package_version
-        run: | 
+        run: |
           $versionString = Get-Content $(Join-Path 'exllamav2' 'version.py') -raw
-          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"') 
+          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"')
           {
             Write-Output $('::notice file=build-wheels-release.yml,line=200,title=Package Version::Detected package version is: {0}' -f $Matches[1])
             Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
@@ -102,7 +96,7 @@ jobs:
           wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
           echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM_VERSION focal main" | sudo tee --append /etc/apt/sources.list.d/rocm.list
           echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' | sudo tee /etc/apt/preferences.d/rocm-pin-600
-          
+
           sudo apt update
           sudo apt install rocm-hip-sdk -y
           sudo apt clean -y
@@ -119,7 +113,7 @@ jobs:
           pip3 install --upgrade setuptools==69.5.1 build wheel safetensors sentencepiece ninja
           pip3 cache purge
 
-          # --- Build wheel 
+          # --- Build wheel
 
           python3 -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=+rocm${{ matrix.rocm }}-torch${{ matrix.torch }}"
 
@@ -144,7 +138,7 @@ jobs:
             Enter-VsDevShell -VsInstallPath 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools' -DevCmdArguments '-arch=x64 -host_arch=x64'
             $env:DISTUTILS_USE_SDK=1
           }
-  
+
           # --- Install CUDA using Conda
           $cudaVersion = '${{ matrix.cuda }}'
           $cudaVersionPytorch = '${{ matrix.cuda }}'.Remove('${{ matrix.cuda }}'.LastIndexOf('.')).Replace('.','')
@@ -155,18 +149,25 @@ jobs:
           if (!(mamba list cuda)[-1].contains('cuda')) {sleep -s 10; mamba install -y 'cuda' $cudaVersion}
           if (!(mamba list cuda)[-1].contains('cuda')) {throw 'CUDA Toolkit failed to install!'}
 
+          # --- Install older libstdcxx-ng and set environment variables for compiler flags (Linux only)
+          if ($IsLinux) {
+            mamba install -y -c conda-forge libstdcxx-ng=9.3.0
+            $env:LDFLAGS = "-L$env:CONDA_PREFIX/lib -Wl,-rpath,$env:CONDA_PREFIX/lib"
+            $env:CXXFLAGS = "-I$env:CONDA_PREFIX/include"
+          }
+
           $env:CUDA_PATH = $env:CONDA_PREFIX
           $env:CUDA_HOME = $env:CONDA_PREFIX
           if ($IsLinux) {$env:LD_LIBRARY_PATH = $env:CONDA_PREFIX + '/lib:' + $env:LD_LIBRARY_PATH}
-          
+
           # --- Install dependencies
-          
+
           python -m ensurepip --upgrade
           python -m pip install torch==${{ matrix.torch }} --index-url https://download.pytorch.org/whl/cu$cudaVersionPytorch
           python -m pip install --upgrade setuptools==69.5.1 build wheel safetensors sentencepiece ninja
 
           # --- Build wheel
-                  
+
           $BUILDTAG = "+cu$cudaVersionPytorch-torch${{ matrix.torch }}"
           $env:TORCH_CUDA_ARCH_LIST = '${{ matrix.cudaarch }}'
           python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
@@ -184,12 +185,12 @@ jobs:
           }
 
           # --- Install dependencies
-          
+
           python -m pip install torch==${{ matrix.torch }} --index-url https://download.pytorch.org/whl/cpu
           python -m pip install build wheel ninja
 
           # --- Build wheel
-           
+
           $env:EXLLAMA_NOCOMPILE=1
           python -m build -n
 
