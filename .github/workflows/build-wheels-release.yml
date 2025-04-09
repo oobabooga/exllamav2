@@ -149,11 +149,6 @@ jobs:
           if (!(mamba list cuda)[-1].contains('cuda')) {sleep -s 10; mamba install -y 'cuda' $cudaVersion}
           if (!(mamba list cuda)[-1].contains('cuda')) {throw 'CUDA Toolkit failed to install!'}
 
-          # --- Set environment variable for ABI compatibility (Linux only)
-          if ($IsLinux) {
-            $env:CXXFLAGS = "-D_GLIBCXX_USE_CXX11_ABI=0 -I$env:CONDA_PREFIX/include"
-          }
-
           $env:CUDA_PATH = $env:CONDA_PREFIX
           $env:CUDA_HOME = $env:CONDA_PREFIX
           if ($IsLinux) {$env:LD_LIBRARY_PATH = $env:CONDA_PREFIX + '/lib:' + $env:LD_LIBRARY_PATH}
