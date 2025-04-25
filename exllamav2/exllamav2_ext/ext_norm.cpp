@@ -162,7 +162,8 @@ void head_norm
     torch::Tensor w,
     torch::Tensor b,
     torch::Tensor y,
-    float epsilon
+    float epsilon,
+    bool rms
 )
 {
     TORCH_CHECK_DTYPE(x, kHalf);
@@ -191,6 +192,7 @@ void head_norm
         b.device().is_meta() ? NULL : (half*) b.data_ptr(),
         (half*) y.data_ptr(),
         epsilon,
+        rms,
         rows,
         num_heads,
         head_dim
@@ -202,8 +204,9 @@ void head_norm_
     torch::Tensor x,
     torch::Tensor w,
     torch::Tensor b,
-    float epsilon
+    float epsilon,
+    bool rms
 )
 {
-    head_norm(x, w, b, x, epsilon);
+    head_norm(x, w, b, x, epsilon, rms);
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from exllamav2 import ExLlamaV2, ExLlamaV2Tokenizer
@@ -16,11 +17,9 @@ def preprocess(
     image: Image
 ) -> (torch.Tensor, tuple):
 
-    assert "longest_edge" in config.vision_size, \
-        "preprocessing size must specify longest_edge"
-
     patch_size = tuple(config.vision_patch_size[d] for d in ["height", "width"])
-    longest_edge = config.vision_size["longest_edge"]
+    size = tuple(config.vision_size[d] for d in ["height", "width"])
+
     resample = Image.Resampling(config.vision_resample)
     image_mean = tuple(config.vision_image_mean)
     image_std = tuple(config.vision_image_std)
@@ -30,7 +29,7 @@ def preprocess(
 
     image = convert_to_rgb(image)
     old_size = image.size
-    new_size = size_to_longest_edge_and_patch_size(image.size, (longest_edge, longest_edge), patch_size)
+    new_size = size
     if old_size != new_size:
         image = image.resize(new_size, resample = resample)
 
@@ -54,28 +53,16 @@ def postprocess(
     features_x: int,
 ):
     """
-    Insert [IMG_BREAK] and [IMG_END] tokens in image feature embeddings
+    Insert <start_of_image> and <end_of_image> tokens in image feature embeddings
     """
 
-    features_x //= model.config.vision_spatial_merge_size
-    features_y //= model.config.vision_spatial_merge_size
+    id_start = tokenizer.single_id("<start_of_image>")
+    id_end = tokenizer.single_id("<end_of_image>")
+    img_start = model.modules[0].forward(torch.tensor([id_start], dtype=torch.long)).to(embeddings.device).half()
+    img_end = model.modules[0].forward(torch.tensor([id_end], dtype=torch.long)).to(embeddings.device).half()
 
-    assert embeddings.shape[0] == features_y * features_x, \
-        "Invalid shape for embeddings"
-
-    id_break = tokenizer.single_id("[IMG_BREAK]")
-    id_end = tokenizer.single_id("[IMG_END]")
-    img_break = model.modules[0].forward(torch.tensor([id_break], dtype=torch.long)).to(embeddings.device)
-    img_end = model.modules[0].forward(torch.tensor([id_end], dtype=torch.long)).to(embeddings.device)
-
-    dim = embeddings.shape[-1]
-    embeddings = embeddings.view((features_y, features_x, dim))
-    break_col = img_break.expand(features_y, -1, -1)
-    embeddings = torch.cat((embeddings, break_col), dim = 1)
-    embeddings = embeddings.view((features_y * (features_x + 1)), dim)
-    embeddings = torch.cat((embeddings, img_end), dim = 0)
-
-    return embeddings, 0, 0
+    embeddings = torch.cat((img_start, embeddings, img_end), dim = 0)
+    return embeddings, 1, 1
 
 
 def position_embeddings(
@@ -87,18 +74,33 @@ def position_embeddings(
     rope_cos: torch.Tensor,
     thw_grid: tuple | None = None,
 ):
-    """
-    Create flat position IDs tensor for grid of patches: id(row, col) = row * max_width + col
-    """
-
     assert thw_grid is None, \
-        "Video not supported for Pixtral"
+        "Video not supported for Siglip"
 
-    row_indices = torch.arange(height).unsqueeze(1) * max_width
-    col_indices = torch.arange(width).unsqueeze(0)
-    ids = row_indices + col_indices
-    ids = ids.flatten().unsqueeze(0)
+    # Siglip uses learned embeddings
+    return None, None
 
-    cos = rope_cos[ids]
-    sin = rope_sin[ids]
-    return sin, cos
+
+def pre_project(
+    config: ExLlamaV2Config,
+    vision_outputs: torch.Tensor
+):
+    bsz, _, seq_length = vision_outputs.shape
+    patches_per_image = int(config.vision_size["width"] // config.vision_patch_size["width"])
+
+    reshaped_vision_outputs = (
+        vision_outputs.transpose(1, 2)
+        .reshape(bsz, seq_length, patches_per_image, patches_per_image)
+        .contiguous()
+    )
+
+    tokens_per_side = int(config.vision_mm_tokens_per_image ** 0.5)
+    kernel_size = patches_per_image // tokens_per_side
+    pooled_vision_outputs = (
+        F.avg_pool2d(reshaped_vision_outputs, kernel_size = kernel_size, stride = kernel_size)
+        .flatten(2)
+        .transpose(1, 2)
+        .contiguous()
+    )
+
+    return pooled_vision_outputs

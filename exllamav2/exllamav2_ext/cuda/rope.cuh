@@ -19,7 +19,8 @@ void rope_cuda
     const int num_heads,
     const int past_len,
     const int32_t* past_lens,
-    const bool neox_style
+    const bool neox_style,
+    int sincos_size
 );
 
 void rope_cuda_qk
@@ -38,6 +39,7 @@ void rope_cuda_qk
     const int past_len,
     const int32_t* past_lens,
     const bool neox_style,
+    int sincos_size,
     Graph* graph = NULL,
     int label = 0
 );

@@ -115,6 +115,11 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         else:
             self.gate_proj = None
 
+        if merge and ap.mlp_patch_merger:
+            self.patch_merger_proj = ExLlamaV2Linear(model, key + km["patch_merger"], in_features * merge**2, in_features, ap.mlp_bias)
+            self.submodules += [self.patch_merger_proj]
+        else:
+            self.patch_merger_proj = None
 
     def numel(self) -> int:
 
@@ -157,6 +162,9 @@ class ExLlamaV2MLP(ExLlamaV2Module):
             down_map = self.down_proj.load(device_context = device_context, unmap = True)
             if self.gate_proj is not None: self.gate_proj.load(device_context = device_context, output_map = down_map)
             self.up_proj.load(device_context = device_context, output_map = down_map)
+
+        if self.patch_merger_proj is not None:
+            self.patch_merger_proj.load()
 
         if self.up_proj.is_quant():
             assert self.gate_proj is None or self.gate_proj.is_quant()
@@ -302,6 +310,8 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         if self.gate_proj is not None: self.gate_proj.set_device_idx(idx)
         self.up_proj.set_device_idx(idx)
         self.down_proj.set_device_idx(idx)
+        if self.patch_merger_proj is not None:
+            self.patch_merger_proj.set_device_idx(idx)
 
 
     # @profile
@@ -458,9 +468,18 @@ class ExLlamaV2MLP(ExLlamaV2Module):
             if self.pre_layernorm else hidden_states
 
         if self.merge:
-            bd = post_norm.shape[:-2]
-            l, d = post_norm.shape[-2:]
-            post_norm = post_norm.view(*bd, l // self.merge, d * self.merge)
+            if self.archparams.mlp_patch_merger:
+                bsz = hidden_states.shape[0]
+                assert bsz == 1
+                (h, w), d = kwargs["patch_size"], hidden_states.shape[-1]
+                image_grid = post_norm.view(h, w, d).permute(2, 0, 1).unsqueeze(0)
+                grid = F.unfold(image_grid, kernel_size = int(self.merge ** 0.5), stride = int(self.merge ** 0.5))
+                grid = grid.view(bsz, d * self.merge, -1).transpose(1, 2)
+                post_norm = self.patch_merger_proj.forward(grid)
+            else:
+                bd = post_norm.shape[:-2]
+                l, d = post_norm.shape[-2:]
+                post_norm = post_norm.view(*bd, l // self.merge, d * self.merge)
 
         if self.gate_proj is not None:
             gate = self.gate_proj.forward(post_norm, loras = loras)

@@ -46,7 +46,8 @@ void head_norm
     torch::Tensor w,
     torch::Tensor b,
     torch::Tensor y,
-    float epsilon
+    float epsilon,
+    bool rms
 );
 
 void head_norm_
@@ -54,7 +55,8 @@ void head_norm_
     torch::Tensor x,
     torch::Tensor w,
     torch::Tensor b,
-    float epsilon
+    float epsilon,
+    bool rms
 );
 
 

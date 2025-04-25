@@ -44,6 +44,7 @@ public:
     half* post_layernorm;
     half* post_layernorm_bias;
     bool layernorm_is_rms;
+    bool headnorm_is_rms;
     float norm_epsilon;
 
     half* q_norm;
@@ -76,6 +77,7 @@ public:
     bool has_residual;
     bool residual_fp32;
     int rope_style;
+    int sincos_size;
 
     bool use_graphs;
     std::unordered_map<QAttn_params_const, Graph*, QAttn_params_const_hash> graph_map;
@@ -85,6 +87,7 @@ public:
         half* _layernorm,
         half* _layernorm_bias,
         bool _layernorm_is_rms,
+        bool _headnorm_is_rms,
         float _norm_epsilon,
         QMatrix* _q_proj,
         QMatrix* _k_proj,
@@ -103,6 +106,7 @@ public:
         int _max_seq_len,
         bool _has_residual,
         int _rope_style,
+        int _sincos_size,
         half* _q_norm,
         half* _k_norm,
         half* _post_layernorm,

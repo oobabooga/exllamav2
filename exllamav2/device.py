@@ -40,8 +40,10 @@ class ExLlamaV2DeviceContext:
     scratch_bytes: int
     scratch_idx: int
 
-    sin: torch.Tensor | None
-    cos: torch.Tensor | None
+    sin: list[torch.Tensor] | None
+    cos: list[torch.Tensor] | None
+    local_sin: list[torch.Tensor] | None
+    local_cos: list[torch.Tensor] | None
 
     scratch: torch.Tensor | None
 
@@ -116,35 +118,53 @@ class ExLlamaV2DeviceContext:
     def prepare_sincos(self):
 
         device = _torch_device(self.device_idx)
-
         cfg = self.model.config
-        if self.archparams.rope_style == RopeStyle.NONE:
-            self.sin = torch.zeros((1,), device = device, dtype = torch.half)
-            self.cos = self.sin
-            return
 
-        # RoPE params
+        thetas = [cfg.rotary_embedding_base]
+        scales = [cfg.scale_pos_emb]
+        if cfg.rotary_embedding_base_alt:
+            thetas.append(cfg.rotary_embedding_base_alt)
+            scales.append(cfg.scale_pos_emb_alt)
 
-        inv_freq, scaling_factor = rope.get_rope_params(device, cfg)
+        self.sin = []
+        self.cos = []
 
-        # Common
+        for theta, lscale in zip(thetas, scales):
 
-        scale = cfg.scale_pos_emb or 1.0
-        t = torch.arange(cfg.max_seq_len, device = device, dtype = torch.float32)
-        if scale != 1.0: t /= scale
+            if self.archparams.rope_style == RopeStyle.NONE:
+                sin = torch.zeros((1,), device = device, dtype = torch.half)
+                cos = sin
+                self.sin.append(sin)
+                self.cos.append(cos)
+                break
 
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        if self.archparams.rope_style == RopeStyle.NEOX:
-            emb = torch.cat((freqs, freqs), dim=-1)
-        elif self.archparams.rope_style == RopeStyle.GPTJ:
-            emb = torch.repeat_interleave(freqs, 2, dim=-1)
-        else:
-            raise ValueError()
+            # RoPE params
 
-        self.sin = emb.sin()[None, None, :, :]
-        self.cos = emb.cos()[None, None, :, :]
-        if scaling_factor != 1.0:
-            self.sin *= scaling_factor
-            self.cos *= scaling_factor
-        self.sin = self.sin.half()
-        self.cos = self.cos.half()
+            inv_freq, scaling_factor = rope.get_rope_params(device, cfg, theta)
+
+            # Common
+
+            scale = lscale or 1.0
+            t = torch.arange(cfg.max_seq_len, device = device, dtype = torch.float32)
+            if cfg.pos_id_index != 0:
+                t += cfg.pos_id_index
+            if scale != 1.0: t /= scale
+
+            freqs = torch.einsum("i,j->ij", t, inv_freq)
+            if self.archparams.rope_style == RopeStyle.NEOX:
+                emb = torch.cat((freqs, freqs), dim=-1)
+            elif self.archparams.rope_style == RopeStyle.GPTJ:
+                emb = torch.repeat_interleave(freqs, 2, dim=-1)
+            else:
+                raise ValueError()
+
+            sin = emb.sin()[None, None, :, :]
+            cos = emb.cos()[None, None, :, :]
+            if scaling_factor != 1.0:
+                sin *= scaling_factor
+                cos *= scaling_factor
+            sin = sin.half()
+            cos = cos.half()
+
+            self.sin.append(sin)
+            self.cos.append(cos)

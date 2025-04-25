@@ -52,7 +52,7 @@ def gen_mrope_embed(
 
     # Get RoPE params
 
-    inv_freq, scaling_factor = rope.get_rope_params("cpu", config)
+    inv_freq, scaling_factor = rope.get_rope_params("cpu", config, config.rotary_embedding_base)
 
     # Create embeddings
 

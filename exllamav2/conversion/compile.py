@@ -18,6 +18,7 @@ import os, glob, shutil, json
 from safetensors import safe_open
 from safetensors.torch import save_file
 from exllamav2.conversion.bot_status import print_stage
+from safetensors import SafetensorError
 
 def _tsize(t):
 
@@ -97,6 +98,10 @@ def compile_model(job, save_fn, model):
                 d = get_q_module(job, module.k_proj); out_dict.update(d); current_size += _dsize(d)
                 d = get_q_module(job, module.v_proj); out_dict.update(d); current_size += _dsize(d)
                 d = get_q_module(job, module.o_proj); out_dict.update(d); current_size += _dsize(d)
+                d = get_f_module(job, module.q_norm)
+                if d: out_dict.update(d); current_size += _dsize(d)
+                d = get_f_module(job, module.k_norm)
+                if d: out_dict.update(d); current_size += _dsize(d)
 
             if isinstance(module, ExLlamaV2MLP):
 
@@ -151,8 +156,18 @@ def compile_model(job, save_fn, model):
             key = extra_tensors[0]
             extra_tensors = extra_tensors[1:]
             file = cfg.tensor_file_map[key]
+
+            lkey = key
+            if cfg.arch.compile_fix_keymap is not None:
+                km = cfg.arch.compile_fix_keymap
+                for (a, b) in km:
+                    if key.endswith(b):
+                        lkey = key[:-len(b)] + a
+                        break
+
             with safe_open(file, framework = "pt") as f:
-                tensor = f.get_tensor(key)
+                tensor = f.get_tensor(lkey)
+
             out_dict.update({key: tensor})
             extra_tensors_size += _tsize(tensor)
 

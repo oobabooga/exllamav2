@@ -3,12 +3,11 @@ from __future__ import annotations
 import torch
 import math
 from exllamav2.stloader import STFile, cleanup_stfiles
-from exllamav2.architecture import ExLlamaV2ArchParams
+from exllamav2.architecture import ExLlamaV2ArchParams, no_default
 import os, glob, json
 from typing import Any, Dict, List, TypeVar, Union, cast
 
 T = TypeVar('T')
-no_default = object()
 
 def read(
     input_dict: dict[str, Any],
@@ -100,6 +99,9 @@ class ExLlamaV2Config:
     norm_eps: float | None
     vocab_size: int
     rotary_embedding_base: float
+    rotary_embedding_base_alt: float | None
+    pos_id_index: int
+    scale_pos_emb_alt: float | None
     scale_long_factor: list[float] | None
     scale_short_factor: list[float] | None
     alt_rope_method: str | None
@@ -127,6 +129,7 @@ class ExLlamaV2Config:
     checkpoint_offset_qzeros: bool
     mrope_section: list | None
     attention_multiplier: float | None
+    partial_rotary_factor: float | None
 
     vision_model_type: str | None
     vision_head_dim: int | None
@@ -244,7 +247,7 @@ class ExLlamaV2Config:
         self.bos_token_id = read(read_config, int, "bos_token_id", None)  # 1
         self.eos_token_id = read(read_config, [int, list], "eos_token_id", None)  # 2
         self.pad_token_id = read(read_config, int, "pad_token_id", None)  # 0
-        self.vocab_size = read(read_config, int, "vocab_size", opt_subkey = "text_config")
+        self.vocab_size = read(read_config, int, "vocab_size", self.arch.lm.default_vocab_size, opt_subkey = "text_config")
 
         if isinstance(self.eos_token_id, list):
             self.eos_token_id = self.eos_token_id[0]  # TODO: Figure out a way to maybe use all the EOS tokens somehow
@@ -257,7 +260,7 @@ class ExLlamaV2Config:
         # Norm params
 
         if self.arch.lm.keys["norm_eps"]:
-            self.norm_eps = read(read_config, float, self.arch.lm.keys["norm_eps"], opt_subkey = "text_config")
+            self.norm_eps = read(read_config, float, self.arch.lm.keys["norm_eps"], self.arch.lm.default_rms_norm_eps, opt_subkey = "text_config")
         else:
             self.norm_eps = 1e-5  # Torch default
 
@@ -272,12 +275,19 @@ class ExLlamaV2Config:
             read_config,
             int,
             "head_dim",
-            (self.hidden_size // self.num_attention_heads) if self.num_attention_heads else no_default,
+            (
+                self.arch.lm.default_head_dim if self.arch.lm.default_head_dim != no_default else
+                (self.hidden_size // self.num_attention_heads) if self.num_attention_heads else
+                no_default
+            ),
             opt_subkey = "text_config"
         )
 
         if not self.num_attention_heads:
-            self.num_attention_heads = self.hidden_size // self.head_dim
+            if self.arch.lm.default_num_attention_heads != no_default:
+                self.num_attention_heads = self.arch.lm.default_num_attention_heads
+            else:
+                self.num_attention_heads = self.hidden_size // self.head_dim
 
         if self.arch.lm.mqa:
             self.num_key_value_heads = 1
@@ -286,14 +296,14 @@ class ExLlamaV2Config:
                 read_config,
                 int,
                 ["num_key_value_heads", "attn_config->kv_n_heads"],
-                self.num_attention_heads,
+                self.arch.lm.default_num_key_value_heads if self.arch.lm.default_num_key_value_heads != no_default else self.num_attention_heads,
                 opt_subkey = "text_config",
             )
         self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
-        self.use_qk_norm = read(read_config, bool, ["use_qk_norm"], False)
+        self.use_qk_norm = read(read_config, bool, ["use_qk_norm"], self.arch.lm.default_use_qk_norm)
 
-        self.query_pre_attn_scalar = read(read_config, float, "query_pre_attn_scalar", None)
-        self.attention_multiplier = read(read_config, float, "attention_multiplier", None)
+        self.query_pre_attn_scalar = read(read_config, float, ["query_pre_attn_scalar"], None, opt_subkey = "text_config")
+        self.attention_multiplier = read(read_config, float, ["attention_multiplier"], None, opt_subkey = "text_config")
 
         # MLP params
 
@@ -345,9 +355,13 @@ class ExLlamaV2Config:
             read_config,
             float,
             ["rope_theta", "attn_config->rope_theta"],
-            10000.0,
+            self.arch.lm.default_rope_theta,
             opt_subkey = "text_config",
         )
+
+        self.rotary_embedding_base_alt = self.arch.lm.sliding_rope_theta
+        self.scale_pos_emb_alt = self.arch.lm.sliding_rope_scale
+        self.pos_id_index = self.arch.lm.pos_id_index
 
         self.max_seq_len = read(
             read_config,
@@ -359,13 +373,16 @@ class ExLlamaV2Config:
         self.original_max_seq_len = self.max_seq_len
 
         self.sliding_window = read(read_config, int, ["sliding_window", "sliding_window_size"], 0, opt_subkey = "text_config")
-        self.sliding_window_pattern = read(read_config, int, ["sliding_window_pattern"], 1)
+        self.sliding_window_pattern = read(read_config, int, ["sliding_window_pattern"], self.arch.lm.default_sliding_window_pattern)
 
-        rs = read(read_config, dict, "rope_scaling", None)
+        self.partial_rotary_factor = read(read_config, float, "partial_rotary_factor", 1.0)
+
+        rs = read(read_config, dict, ["rope_scaling", "text_config->rope_scaling"], None)
         if rs:
             scaling_type = rs.get("type", None)
             rope_type = rs.get("rope_type", None)
             assert not (scaling_type and rope_type), "rope_scaling key has both `type` and `rope_type` subkeys"
+            if not scaling_type: scaling_type = rope_type
             if scaling_type == "linear":
                 assert "factor" in rs, "'factor' missing from 'rope_scaling' config"
                 self.scale_pos_emb = rs.get("factor", 1.0)
@@ -382,7 +399,7 @@ class ExLlamaV2Config:
                 self.alt_rope_method = "yarn"
                 self.yarn_rope_factor = rs["factor"]
                 self.yarn_rope_original_max_position_embeddings = rs["original_max_position_embeddings"]
-            if rope_type == "llama3":
+            if scaling_type == "llama3":
                 self.alt_rope_method = "llama3"
                 self.l3_rope_factor = rs["factor"]
                 self.l3_rope_low_freq_factor = rs["low_freq_factor"]
@@ -486,6 +503,38 @@ class ExLlamaV2Config:
         if self.vision_model_type is None:
             pass
 
+        elif self.vision_model_type == "siglip_vision_model":
+            self.vision_num_attention_heads = read(read_config, int, ["vision_config->num_attention_heads"], no_default)
+            self.vision_num_key_value_heads = read(read_config, int, ["vision_config->num_key_value_heads"], self.vision_num_attention_heads)
+            self.vision_num_key_value_groups = self.vision_num_attention_heads // self.vision_num_key_value_heads
+            self.vision_hidden_size = read(read_config, int, ["vision_config->hidden_size"], no_default)
+            self.vision_head_dim = read(read_config, int, ["vision_config->head_dim"], self.vision_hidden_size // self.vision_num_attention_heads)
+            self.multimodal_projector_bias = read(read_config, bool, ["multimodal_projector_bias"], False)
+
+            patch_size = read(read_config, int, ["vision_config->patch_size"], no_default)
+            self.vision_patch_size = {"width": patch_size, "height": patch_size}
+            self.vision_hidden_act = read(read_config, str, ["vision_config->hidden_act"], "silu")
+            self.vision_num_layers = read(read_config, int, ["vision_config->num_hidden_layers"], 24)
+            self.vision_intermediate_size = read(read_config, int, ["vision_config->intermediate_size"], self.hidden_size)
+
+            image_processor_type = read(read_prep_config, str, ["image_processor_type"], no_default)
+            assert image_processor_type == "Gemma3ImageProcessor", \
+                f"Wrong image processor type: {image_processor_type}"
+            self.vision_image_mean = read(read_prep_config, list, ["image_mean"], no_default)
+            self.vision_image_std = read(read_prep_config, list, ["image_std"], no_default)
+            # self.vision_patch_size = read(read_prep_config, dict, ["patch_size"], no_default)
+            # assert all(self.vision_patch_size.get(x) == patch_size for x in ["width", "height"]), \
+            #     "Patch size inconsistency between config.json and preprocessor_config.json"
+            self.vision_resample = read(read_prep_config, int, ["resample"], no_default)
+            self.vision_rescale_factor = read(read_prep_config, float, ["rescale_factor"], no_default)
+            self.vision_size = read(read_prep_config, dict, ["size"], no_default)
+            self.vision_mm_tokens_per_image = read(read_config, int, "mm_tokens_per_image", no_default)
+            self.vision_num_channels = 3
+            self.vision_spatial_merge_size = 1
+            self.vision_max_size = 16384
+            self.vision_window_size = None
+
+
         elif self.vision_model_type == "pixtral":
             self.vision_head_dim = read(read_config, int, ["vision_config->head_dim"], no_default)
             self.vision_num_attention_heads = read(read_config, int, ["vision_config->num_attention_heads"], no_default)
@@ -503,18 +552,20 @@ class ExLlamaV2Config:
             self.vision_merger_intermediate_size = self.vision_intermediate_size
 
             image_processor_type = read(read_prep_config, str, ["image_processor_type"], no_default)
-            assert image_processor_type == "PixtralImageProcessor", \
+            assert image_processor_type == "PixtralImageProcessor" or image_processor_type == "PixtralImageProcessorFast", \
                 f"Wrong image processor type: {image_processor_type}"
             self.vision_image_mean = read(read_prep_config, list, ["image_mean"], no_default)
             self.vision_image_std = read(read_prep_config, list, ["image_std"], no_default)
-            self.vision_patch_size = read(read_prep_config, dict, ["patch_size"], no_default)
+            self.vision_patch_size = read(read_prep_config, object, ["patch_size"], no_default)
+            if isinstance(self.vision_patch_size, int):
+                self.vision_patch_size = {"width": self.vision_patch_size, "height": self.vision_patch_size}
             assert all(self.vision_patch_size.get(x) == patch_size for x in ["width", "height"]), \
                 "Patch size inconsistency between config.json and preprocessor_config.json"
             self.vision_resample = read(read_prep_config, int, ["resample"], no_default)
             self.vision_rescale_factor = read(read_prep_config, float, ["rescale_factor"], no_default)
             self.vision_size = read(read_prep_config, dict, ["size"], no_default)
             self.vision_num_channels = 3
-            self.vision_spatial_merge_size = 1
+            self.vision_spatial_merge_size = read(read_config, int, ["spatial_merge_size"], 1)
             self.vision_max_size = 16384
             self.vision_window_size = None
 
@@ -533,7 +584,7 @@ class ExLlamaV2Config:
                 self.vision_intermediate_size = read(read_config, int, ["vision_config->intermediate_size"], no_default)
                 self.vision_fullatt_block_indexes = read(read_config, list, ["vision_config->fullatt_block_indexes", None])
                 self.vision_window_size = read(read_config, int, ["vision_config->window_size", None])
-                assert image_processor_type == "Qwen2_5_VLImageProcessor", \
+                assert image_processor_type == "Qwen2_5_VLImageProcessor" or image_processor_type == "Qwen2VLImageProcessor", \
                     f"Wrong image processor type: {image_processor_type}"
                 self.vision_merger_intermediate_size = 5120  # TODO: This doesn't seem to appear in the config anywhere?
 
@@ -565,7 +616,7 @@ class ExLlamaV2Config:
             self.vision_max_size = 16384
 
         else:
-            raise ValueError(f"Unsupported vision model type: {self.vision_model_type}")
+            print(f" !! Warning: Unsupported vision model type: {self.vision_model_type}")
 
         # Cleanup
 

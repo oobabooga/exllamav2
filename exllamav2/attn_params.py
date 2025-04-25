@@ -194,7 +194,7 @@ class Params:
                 return None
             positions = torch.arange(csl[-1], device = csl.device)
             labels = torch.searchsorted(csl[1:], positions, right = True)
-            self.block_diag_mask = labels.unsqueeze(0) == labels.unsqueeze(1).repeat(self.batch_size)
+            self.block_diag_mask = torch.where(labels.unsqueeze(0) == labels.unsqueeze(1).repeat(1, self.batch_size), 0, -65504.0).half()
         if self.block_diag_mask.device.index != device:
             self.block_diag_mask = safe_move_tensor(self.block_diag_mask, device, non_blocking = True)
         return self.block_diag_mask

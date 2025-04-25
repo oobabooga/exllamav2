@@ -17,15 +17,16 @@ __forceinline__ __device__ void rope_cuda_arr_neox
     int num_heads,
     int past_len,
     const int32_t* __restrict__ past_lens,
-    int threads_y
+    int threads_y,
+    int sincos_size
 )
 {
     MatrixView_half_rw x_(x, MAX_ROWS, head_dim);
-    MatrixView_half sin_(sin, MAX_POS_EMBEDDINGS, head_dim);
-    MatrixView_half cos_(cos, MAX_POS_EMBEDDINGS, head_dim);
+    MatrixView_half sin_(sin, MAX_POS_EMBEDDINGS, sincos_size);
+    MatrixView_half cos_(cos, MAX_POS_EMBEDDINGS, sincos_size);
 
     int column = (blockIdx.x * THREADS_X + threadIdx.x) * 2;
-    int half_dim = head_dim / 2;
+    int half_dim = sincos_size / 2;
     if (column >= half_dim) return;
 
     int row = blockIdx.y * threads_y + threadIdx.y;
@@ -76,15 +77,16 @@ __forceinline__ __device__ void rope_cuda_arr_gptj
     int num_heads,
     int past_len,
     const int32_t* __restrict__ past_lens,
-    int threads_y
+    int threads_y,
+    int sincos_size
 )
 {
     MatrixView_half_rw x_(x, MAX_ROWS, head_dim);
-    MatrixView_half sin_(sin, MAX_POS_EMBEDDINGS, head_dim);
-    MatrixView_half cos_(cos, MAX_POS_EMBEDDINGS, head_dim);
+    MatrixView_half sin_(sin, MAX_POS_EMBEDDINGS, sincos_size);
+    MatrixView_half cos_(cos, MAX_POS_EMBEDDINGS, sincos_size);
 
     int column = (blockIdx.x * THREADS_X + threadIdx.x) * 2;
-    if (column >= head_dim) return;
+    if (column >= sincos_size) return;
 
     int row = blockIdx.y * threads_y + threadIdx.y;
     if (row >= rows_per_batch) return;
@@ -131,13 +133,14 @@ __global__ void rope_cuda_kernel
     int past_len,
     const int32_t* __restrict__ past_lens,
     int threads_y,
-    const bool neox_style
+    const bool neox_style,
+    int sincos_size
 )
 {
     if (neox_style)
-        rope_cuda_arr_neox(x, sin, cos, rows_per_batch, head_dim, num_heads, past_len, past_lens, threads_y);
+        rope_cuda_arr_neox(x, sin, cos, rows_per_batch, head_dim, num_heads, past_len, past_lens, threads_y, sincos_size);
     else
-        rope_cuda_arr_gptj(x, sin, cos, rows_per_batch, head_dim, num_heads, past_len, past_lens, threads_y);
+        rope_cuda_arr_gptj(x, sin, cos, rows_per_batch, head_dim, num_heads, past_len, past_lens, threads_y, sincos_size);
 }
 
 __global__ void rope_cuda_qk_kernel
@@ -154,18 +157,19 @@ __global__ void rope_cuda_qk_kernel
     int past_len,
     const int32_t* __restrict__ past_lens,
     int threads_y,
-    const bool neox_style
+    const bool neox_style,
+    int sincos_size
 )
 {
     if (neox_style)
     {
-        rope_cuda_arr_neox(x_q, sin, cos, rows_per_batch_q, head_dim, num_heads_q, past_len, past_lens, threads_y);
-        rope_cuda_arr_neox(x_k, sin, cos, rows_per_batch_k, head_dim, num_heads_k, past_len, past_lens, threads_y);
+        rope_cuda_arr_neox(x_q, sin, cos, rows_per_batch_q, head_dim, num_heads_q, past_len, past_lens, threads_y, sincos_size);
+        rope_cuda_arr_neox(x_k, sin, cos, rows_per_batch_k, head_dim, num_heads_k, past_len, past_lens, threads_y, sincos_size);
     }
     else
     {
-        rope_cuda_arr_gptj(x_q, sin, cos, rows_per_batch_q, head_dim, num_heads_q, past_len, past_lens, threads_y);
-        rope_cuda_arr_gptj(x_k, sin, cos, rows_per_batch_k, head_dim, num_heads_k, past_len, past_lens, threads_y);
+        rope_cuda_arr_gptj(x_q, sin, cos, rows_per_batch_q, head_dim, num_heads_q, past_len, past_lens, threads_y, sincos_size);
+        rope_cuda_arr_gptj(x_k, sin, cos, rows_per_batch_k, head_dim, num_heads_k, past_len, past_lens, threads_y, sincos_size);
     }
 }
 
@@ -181,7 +185,8 @@ void rope_cuda
     const int num_heads,
     const int past_len,
     const int32_t* past_lens,
-    const bool neox_style
+    const bool neox_style,
+    int sincos_size
 )
 {
     // For large batch sizes we risk exceeding grid dimension of 65535, so shift to block dimension instead
@@ -207,7 +212,8 @@ void rope_cuda
         past_len,
         past_lens,
         threads_y,
-        neox_style
+        neox_style,
+        sincos_size
     );
 }
 
@@ -227,6 +233,7 @@ void rope_cuda_qk
     const int past_len,
     const int32_t* past_lens,
     const bool neox_style,
+    int sincos_size,
     Graph* graph,
     int label
 )
@@ -258,7 +265,8 @@ void rope_cuda_qk
         past_len,
         past_lens,
         threads_y,
-        neox_style
+        neox_style,
+        sincos_size
     );
 
     if (graph) graph->attach_label(stream, label, 0);

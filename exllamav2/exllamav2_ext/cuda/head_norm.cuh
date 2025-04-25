@@ -15,6 +15,7 @@ void head_norm_cuda
     const half* b,
     half* y,
     const float epsilon,
+    bool rms,
     const int rows,
     const int num_heads,
     const int head_dim,

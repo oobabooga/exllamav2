@@ -16,6 +16,10 @@ layer_keys_gemma2_norms = [["input_layernorm"],
                            ["post_feedforward_layernorm"]]
 layer_keys_internlm2_norms = [["attention_norm"],
                               ["ffn_norm"]]
+layer_keys_glm4_norms = [["input_layernorm"],
+                          ["post_self_attn_layernorm"],
+                          ["post_attention_layernorm"],
+                          ["post_mlp_layernorm"]]
 layer_keys_llama_attn = [["self_attn.q_proj"],
                          ["self_attn.k_proj"],
                          ["self_attn.v_proj"],
@@ -94,6 +98,9 @@ internlm2_keymap = [("$output.", "lm_head."),
                     ("$model.tok_embeddings.", "model.embed_tokens."),
                     (".attention.", ".self_attn."),
                     (".wo.", ".o_proj.")]
+google_keymap = [("mm_input_projection_weight", "mm_input_projection.weight")]
+
+no_default = object()
 
 class RopeStyle(IntEnum):
     NONE = 0
@@ -118,6 +125,7 @@ class ExLlamaV2ArchParams:
         arch_recognized = False
 
         self.keymap = None
+        self.compile_fix_keymap = None
 
         @dataclass
         class Params:
@@ -164,6 +172,9 @@ class ExLlamaV2ArchParams:
             # SWA required by architecture
             swa = False
             alternating_swa = False
+            sliding_rope_theta = None
+            sliding_rope_scale = None
+            pos_id_index = 0
 
             # Model only works with eager attention
             eager_attn_only = False
@@ -202,6 +213,7 @@ class ExLlamaV2ArchParams:
 
             # Layer norm type
             norm = "rmsnorm"
+            headnorm = "layernorm"
 
             # RoPE style
             rope_style = RopeStyle.NEOX
@@ -210,6 +222,16 @@ class ExLlamaV2ArchParams:
             expect_keys: list[str] = field(default_factory = lambda: [])
             layer_keys: list[str] = field(default_factory = lambda: [])
 
+            # Defaults because Gemma3
+            default_vocab_size = no_default
+            default_rms_norm_eps = no_default
+            default_head_dim = no_default
+            default_num_attention_heads = no_default
+            default_num_key_value_heads = no_default
+            default_use_qk_norm = False
+            default_sliding_window_pattern = 1
+            default_rope_theta = 10000
+
             # Vision stuff
             patch_conv_bias: bool = False
             is_vision: bool = False
@@ -217,6 +239,10 @@ class ExLlamaV2ArchParams:
             vision_conv3d: bool = False
             mrope: bool = False
             rope_freq_half: bool = False
+            learned_emb: bool = False
+            output_norm: bool = False
+            mlp_merger: bool = False
+            mlp_patch_merger: bool = False
 
         # Component models
         self.lm_prefix = ""
@@ -302,7 +328,9 @@ class ExLlamaV2ArchParams:
                 "norm_1": ".attention_norm",
                 "norm_2": ".ffn_norm",
                 "layers": "transformer.layers",
+                "ln_pre": "ln_pre",
             })
+            self.vt.mlp_merger = True
 
             self.mmp_prefix = "multi_modal_projector."
             self.mmp.keys.update({
@@ -310,6 +338,52 @@ class ExLlamaV2ArchParams:
                 "mlp_up": "linear_1",
                 "mlp_down": "linear_2",
             })
+            self.mmp.mlp_gate = False
+            self.mmp.mlp_act_func = "gelu"
+            self.mmp.mlp_bias = bool(read_config.get("multimodal_projector_bias", True))
+
+        # Mistral 3 multimodal
+
+        if (
+            arch_string == "Mistral3ForConditionalGeneration" and
+            "vision_config" in read_config and
+            read_config["vision_config"].get("model_type") == "pixtral"
+        ):
+            arch_recognized = True
+            self.lm_prefix = "language_model."
+            self.lm.layer_keys += \
+                layer_keys_llama_norms + \
+                layer_keys_llama_attn + \
+                layer_keys_llama_mlp
+            self.lm.expect_keys += \
+                expect_keys_llama
+
+            self.vt_prefix = "vision_tower."
+            self.vt.keys.update({
+                "attn_q": ".attention.q_proj",
+                "attn_k": ".attention.k_proj",
+                "attn_v": ".attention.v_proj",
+                "attn_o": ".attention.o_proj",
+                "mlp_gate": ".feed_forward.gate_proj",
+                "mlp_up": ".feed_forward.up_proj",
+                "mlp_down": ".feed_forward.down_proj",
+                "norm_1": ".attention_norm",
+                "norm_2": ".ffn_norm",
+                "layers": "transformer.layers",
+                "ln_pre": "ln_pre",
+            })
+            self.vt.mlp_merger = True
+            self.vt.mlp_patch_merger = True
+
+            self.mmp_prefix = "multi_modal_projector."
+            self.mmp.keys.update({
+                "norm_2": "norm",
+                "mlp_gate": None,
+                "mlp_up": "linear_1",
+                "mlp_down": "linear_2",
+                "patch_merger": "patch_merger.merging_layer",
+            })
+            self.mmp.mlp_patch_merger = True
             self.mmp.mlp_gate = False
             self.mmp.mlp_act_func = "gelu"
             self.mmp.mlp_bias = bool(read_config.get("multimodal_projector_bias", True))
@@ -406,6 +480,7 @@ class ExLlamaV2ArchParams:
             self.vt.attention_bias_o = True
             self.vt.vision_input_norm = False
             self.vt.vision_conv3d = True
+            self.vt.mlp_merger = True
 
             self.mmp_prefix = "visual.merger."
             self.mmp.keys.update({
@@ -462,6 +537,82 @@ class ExLlamaV2ArchParams:
             self.lm.requires_bos = True
             self.lm.alternating_swa = True
             self.lm.residual_stream_fp32 = True
+
+        # Gemma3
+
+        if arch_string == "Gemma3ForConditionalGeneration":
+            arch_recognized = True
+            self.lm.layer_keys += \
+                layer_keys_gemma2_norms + \
+                layer_keys_llama_attn + \
+                layer_keys_llama_mlp
+            self.lm.expect_keys += \
+                expect_keys_gemma
+            self.lm.keys.update({
+                "lm_head": "model.embed_tokens",
+                "norm_1": ".input_layernorm",
+                "norm_1_post": ".post_attention_layernorm",
+                "norm_2": ".pre_feedforward_layernorm",
+                "norm_2_post": ".post_feedforward_layernorm",
+            })
+            self.lm_prefix = "language_model."
+            self.lm.mlp_act_func = "gelu"
+            self.lm.normalize_embeddings = True
+            self.lm.norm_constant_bias = 1
+            self.lm.requires_bos = True
+            self.lm.alternating_swa = True
+            self.lm.residual_stream_fp32 = True
+            self.lm.sliding_rope_theta = 10000
+            self.lm.sliding_rope_scale = 1
+            self.lm.default_vocab_size = 262208
+            self.lm.default_rms_norm_eps = 1e-06
+            self.lm.default_head_dim = 256
+            self.lm.default_num_attention_heads = 8
+            self.lm.default_num_key_value_heads = 4
+            self.lm.default_use_qk_norm = True
+            self.lm.default_sliding_window_pattern = 6
+            self.lm.default_rope_theta = 1e6
+            self.lm.pos_id_index = 1
+            self.lm.headnorm = "rmsnorm"
+
+            self.vt_prefix = "vision_tower.vision_model."
+            self.vt.keys.update({
+                "attn_q": ".self_attn.q_proj",
+                "attn_k": ".self_attn.k_proj",
+                "attn_v": ".self_attn.v_proj",
+                "attn_o": ".self_attn.out_proj",
+                "norm_1": ".layer_norm1",
+                "norm_2": ".layer_norm2",
+                "mlp_gate": None,
+                "mlp_up": ".mlp.fc1",
+                "mlp_down": ".mlp.fc2",
+                "layers": "encoder.layers",
+                "patch_conv": "embeddings.patch_embedding",
+                "position_embedding": "embeddings.position_embedding",
+                "output_norm": "post_layernorm",
+            })
+            self.vt.norm = "rmsnorm"
+            self.vt.patch_conv_bias = True
+            self.vt.mlp_gate = False
+            self.vt.mlp_bias = True
+            self.vt.attention_bias_qkv = True
+            self.vt.attention_bias_o = True
+            self.vt.vision_input_norm = False
+            self.vt.mlp_merger = False
+            self.vt.norm = "layernorm"
+            self.vt.learned_emb = True
+            self.vt.rope_style = RopeStyle.NONE
+            self.vt.mlp_act_func = "gelu"
+            self.vt.output_norm = True
+
+            self.keymap = google_keymap
+            self.compile_fix_keymap = google_keymap
+            self.mmp_prefix = "multi_modal_projector."
+            self.mmp.keys.update({
+                "input_projection": "mm_input_projection",
+                "input_projection_norm": "mm_soft_emb_norm",
+            })
+            self.mmp.norm_constant_bias = 1
 
         # StarCoder2
 
@@ -709,6 +860,28 @@ class ExLlamaV2ArchParams:
             self.lm.expect_keys += \
                 expect_keys_llama
 
+        # GLM4
+
+        if arch_string == "Glm4ForCausalLM":
+            arch_recognized = True
+            self.lm.layer_keys += \
+                layer_keys_glm4_norms + \
+                layer_keys_llama_attn + \
+                layer_keys_phi3_mlp
+            self.lm.expect_keys += \
+                expect_keys_llama
+            self.lm.supports_tp = True
+            self.lm.rope_style = RopeStyle.GPTJ
+            self.lm.keys.update({
+                "fused_mlp_12": "gate_up_proj",
+                "lm_head": "model.embed_tokens",
+                "norm_1": ".input_layernorm",
+                "norm_1_post": ".post_self_attn_layernorm",
+                "norm_2": ".post_attention_layernorm",
+                "norm_2_post": ".post_mlp_layernorm",
+            })
+            self.lm.attention_bias_qkv = read_config.get("attention_bias", False)
+
         # Llama (default + fallback)
 
         if arch_string != "LlamaForCausalLM" and not arch_recognized:
@@ -726,7 +899,7 @@ class ExLlamaV2ArchParams:
 
         # Arch overrides
 
-        if read_config.get("attention_bias", False):
+        if read_config.get("attention_bias", False) and not (self.lm.attention_bias_qkv or self.lm.attention_bias_o):
             self.lm.attention_bias_qkv = True
             self.lm.attention_bias_o = True
 

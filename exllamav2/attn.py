@@ -135,7 +135,8 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         has_norm: bool = True,
         has_residual: bool = True,
         sliding_window: int = 0,
-        archparams = None
+        archparams = None,
+        rope_index: int = 0
     ):
         super().__init__(model, key, archparams)
 
@@ -149,6 +150,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         self.layer_idx = layer_idx
         self.has_norm = has_norm
         self.has_residual = has_residual
+        self.rope_index = rope_index
 
         self.q_handle = None
         self.temp_lora_size = 0
@@ -191,7 +193,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         self.v_proj = ExLlamaV2Linear(model, key + km["attn_v"], hidden_size, self.num_key_value_heads * self.head_dim, ap.attention_bias_qkv, f_key = f_key, f_beg = f_c, f_end = f_d, altpack_qkv = ap.fused_qkv_altpack)
         self.o_proj = ExLlamaV2Linear(model, key + km["attn_o"], self.num_attention_heads * self.head_dim, hidden_size, ap.attention_bias_o, prescale = cfg.scale_depth)
 
-        if cfg.use_qk_norm:
+        if cfg.use_qk_norm and not ap.is_vision:
             self.q_norm = ExLlamaV2HeadNorm(model, key + ".self_attn.q_norm", self.num_attention_heads, self.head_dim)
             self.k_norm = ExLlamaV2HeadNorm(model, key + ".self_attn.k_norm", self.num_key_value_heads, self.head_dim)
         else:
@@ -208,7 +210,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             self.submodules += [self.pre_layernorm]
         if self.post_layernorm:
             self.submodules += [self.post_layernorm]
-        if cfg.use_qk_norm:
+        if self.q_norm is not None:
             self.submodules += [self.q_norm, self.k_norm]
 
         if cfg.attention_multiplier:
@@ -299,6 +301,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 norm_weight,
                 norm_bias,
                 is_rms,
+                self.archparams.headnorm == "rmsnorm",
                 eps,
                 self.q_proj.q_handle,
                 self.k_proj.q_handle,
@@ -317,6 +320,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 cfg.max_seq_len,
                 self.has_residual,
                 self.archparams.rope_style.value,
+                int(cfg.head_dim * cfg.partial_rotary_factor),
                 q_norm,
                 k_norm,
                 post_norm_weight,
@@ -502,7 +506,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
         sc = attn_params.get_alt_rope_embed(self.device_idx)
         if not sc:
-            sin, cos = constants.sin, constants.cos
+            sin, cos = constants.sin[self.rope_index], constants.cos[self.rope_index]
         else:
             sin, cos = sc
 
@@ -552,7 +556,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             q = q.view(batch_size, q_len, self.num_attention_heads, self.head_dim)
             k = k.view(batch_size, q_len, self.num_key_value_heads, self.head_dim)
             v = v.view(batch_size, q_len, self.num_key_value_heads, self.head_dim)
-            if cfg.use_qk_norm:
+            if self.q_norm is not None:
                 q = self.q_norm.forward(q)
                 k = self.k_norm.forward(k)
             if self.archparams.rope_style != RopeStyle.NONE:
@@ -627,7 +631,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         else:
             hidden_states = self.o_proj.forward(attn_output, loras = loras)
             if self.post_layernorm:
-                hidden_states = self.post_layernorm.forward(hidden_states)
+                hidden_states = self.post_layernorm.forward(hidden_states, output_fp32 = self.archparams.residual_stream_fp32)
             if self.has_residual:
                 hidden_states += residual
 
@@ -757,7 +761,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         q = [q_.view(batch_size, q_len, q_.shape[1] // self.head_dim, self.head_dim) for q_ in q]
         k = [k_.view(batch_size, q_len, k_.shape[1] // self.head_dim, self.head_dim) for k_ in k]
         v = [v_.view(batch_size, q_len, v_.shape[1] // self.head_dim, self.head_dim) for v_ in v]
-        if cfg.use_qk_norm:
+        if self.q_norm is not None:
             assert False, "TP not implemented for QK norm"  # TODO: ...
             # q = self.q_norm.forward(q)
             # k = self.k_norm.forward(k)
@@ -768,8 +772,8 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 for t, heads in [(q[idx], self.num_key_value_groups), (k[idx], 1)]:
                     ext_c.rope_(
                         t,
-                        context.sin,
-                        context.cos,
+                        context.sin[self.rope_index],
+                        context.cos[self.rope_index],
                         0,
                         (b - a) * heads,
                         self.head_dim,
@@ -882,8 +886,10 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 k_states = k_states[:, :, -self.sliding_window:, :]
                 v_states = v_states[:, :, -self.sliding_window:, :]
 
-            if self.layer_idx in attn_params.block_diag_layers:
+            if self.layer_idx in attn_params.block_diag_layers or causal:
                 attn_mask_lr = attn_params.get_block_diag_mask(q_states.device)
+            elif not causal:
+                attn_mask_lr = None
             elif attn_params.is_causal():
                 attn_mask_lr = causal_lower_right(q_len, k_states.shape[2])
             else:
@@ -892,7 +898,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 q_states,
                 k_states,
                 v_states,
-                attn_mask_lr if causal else None,
+                attn_mask_lr,
                 scale = self.scaling
             )
 
@@ -910,10 +916,12 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 attn_mask = attn_params.get_block_diag_mask(attn_weights.device)
             elif causal:
                 attn_mask = attn_params.get_attn_mask(attn_weights.device)
+            else:
+                attn_mask = None
 
             if cfg.attn_logit_softcapping:
                 ext_c.softcap_(attn_weights, cfg.attn_logit_softcapping)
-            if causal and attn_mask is not None:
+            if attn_mask is not None:
                 attn_weights = attn_weights + attn_mask
             if self.sliding_window and k_states.shape[-1] >= self.sliding_window:
                 attn_weights = attn_weights[:, :, :, -self.sliding_window:]
@@ -1109,6 +1117,12 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 offset = attn_params.rope_offsets.cpu().item()
                 pass_past_len_1 += offset
 
+        sc = attn_params.get_alt_rope_embed(self.device_idx)
+        if not sc:
+            sin, cos = constants.sin[self.rope_index], constants.cos[self.rope_index]
+        else:
+            sin, cos = sc
+
         ext_c.q_attn_forward_1(
             self.q_handle,
             hidden_states,
@@ -1119,8 +1133,8 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             q_states,
             k_states,
             v_states,
-            constants.sin,
-            constants.cos,
+            sin,
+            cos,
             pass_loras,
             pass_lora_temp
         )
@@ -1293,8 +1307,8 @@ class ExLlamaV2Attention(ExLlamaV2Module):
                 for t, heads in [(q[idx], self.num_key_value_groups), (k[idx], 1)]:
                     ext_c.rope_(
                         t,
-                        context.sin,
-                        context.cos,
+                        context.sin[self.rope_index],
+                        context.cos[self.rope_index],
                         past_len,
                         (b - a) * heads,
                         self.head_dim,
@@ -1418,7 +1432,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
         # Apply Q/K norms
 
-        if cfg.use_qk_norm:
+        if self.q_norm is not None:
             query_states = self.q_norm.forward(query_states)
             key_states = self.k_norm.forward(key_states)
 
@@ -1433,7 +1447,7 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
         if self.archparams.rope_style != RopeStyle.NONE:
             alt_cs = kwargs.get("alt_rope_embedding")
-            cos, sin = alt_cs if alt_cs else (constants.cos, constants.sin)
+            cos, sin = alt_cs if alt_cs else (constants.cos[self.rope_index], constants.sin[self.rope_index])
 
             sc = attn_params.get_alt_rope_embed(self.device_idx)
             if sc: sin, cos = sc

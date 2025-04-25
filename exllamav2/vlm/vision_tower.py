@@ -12,10 +12,14 @@ from exllamav2.attn import ExLlamaV2Attention
 from exllamav2.mlp import ExLlamaV2MLP
 from exllamav2.config import ExLlamaV2Config
 from exllamav2.module import ExLlamaV2Module
+from exllamav2.linear import ExLlamaV2Linear
+from exllamav2.pos_embedding import ExLlamaV2PosEmbedding
 from exllamav2.compat import safe_move_tensor
 from exllamav2.generator import ExLlamaV2MMEmbedding
+from exllamav2.layernorm import ExLlamaV2LayerNorm
+from exllamav2.architecture import RopeStyle
 
-from exllamav2.vlm.processor import pixtral, qwen2
+from exllamav2.vlm.processor import pixtral, qwen2, siglip
 from exllamav2.vlm.util import convert_to_rgb
 
 from PIL.Image import Image
@@ -43,13 +47,24 @@ class ExLlamaV2VisionTower(ExLlamaV2):
         if cfg.vision_model_type == "pixtral":
             self.preprocess_func = pixtral.preprocess
             self.postprocess_func = pixtral.postprocess
+            self.pre_project = None
+            self.pre_project_idx = None
             self.video_preprocess_func = None
             self.video_postprocess_func = None
         elif cfg.vision_model_type in ["qwen2", "qwen2.5"]:
             self.preprocess_func = qwen2.preprocess
             self.postprocess_func = qwen2.postprocess
+            self.pre_project = None
+            self.pre_project_idx = None
             self.video_preprocess_func = qwen2.preprocess
             self.video_postprocess_func = qwen2.postprocess
+        elif cfg.vision_model_type == "siglip_vision_model":
+            self.preprocess_func = siglip.preprocess
+            self.postprocess_func = siglip.postprocess
+            self.pre_project = siglip.pre_project
+            self.pre_project_idx = -2
+            self.video_preprocess_func = None
+            self.video_postprocess_func = None
 
         else:
             raise ValueError(f"Unknown vision model type: {cfg.vision_model_type}")
@@ -91,6 +106,13 @@ class ExLlamaV2VisionTower(ExLlamaV2):
 
             self.position_emb_func = qwen2.position_embeddings
 
+        elif cfg.vision_model_type == "siglip_vision_model":
+
+            self.rope_sin = None
+            self.rope_cos = None
+            self.p_maxedge = max(cfg.vision_size["width"], cfg.vision_size["height"])
+            self.position_emb_func = siglip.position_embeddings
+
         # Patch embeddings
 
         if cfg.arch.vt.vision_conv3d:
@@ -121,10 +143,20 @@ class ExLlamaV2VisionTower(ExLlamaV2):
         if self.archparams.vision_input_norm:
             norm = ExLlamaV2RMSNorm(
                 model = self,
-                key = cfg.arch.vt_prefix + "ln_pre",
+                key = cfg.arch.vt_prefix + km["ln_pre"],
                 archparams = self.archparams,
             )
             self.modules += [norm]
+
+        # Learned embeddings
+
+        if self.archparams.learned_emb:
+            emb = ExLlamaV2PosEmbedding(
+                self,
+                cfg.arch.vt_prefix + km["position_embedding"],
+                override_max_seq_len = True
+            )
+            self.modules += [emb]
 
         # Decoder layers
 
@@ -134,23 +166,51 @@ class ExLlamaV2VisionTower(ExLlamaV2):
             mlp = ExLlamaV2MLP(self, layer_key, layer_idx, archparams = self.archparams, pad32 = False)
             self.modules += [attn, mlp]
 
+        # Output norm
+
+        if self.archparams.output_norm:
+            norm = ExLlamaV2LayerNorm(
+                model = self,
+                key = cfg.arch.vt_prefix + km["output_norm"],
+                archparams = cfg.arch.vt,
+            )
+            self.modules += [norm]
+
         # Multimodal projection
 
-        merge = cfg.vision_spatial_merge_size ** 2
-        mmp = ExLlamaV2MLP(
-            self,
-            cfg.arch.mmp_prefix,
-            0,
-            archparams = cfg.arch.mmp,
-            in_features = cfg.vision_hidden_size * merge,
-            out_features = cfg.hidden_size,
-            interm_features = cfg.vision_merger_intermediate_size,
-            has_norm = True,
-            has_residual = False,
-            merge = merge,
-            pad32 = False,
-        )
-        self.modules += [mmp]
+        if self.archparams.mlp_merger:
+            merge = cfg.vision_spatial_merge_size ** 2
+            mmp = ExLlamaV2MLP(
+                self,
+                cfg.arch.mmp_prefix,
+                0,
+                archparams = cfg.arch.mmp,
+                in_features = cfg.vision_hidden_size * merge,
+                out_features = cfg.hidden_size,
+                interm_features = cfg.vision_merger_intermediate_size,
+                has_norm = True,
+                has_residual = False,
+                merge = merge,
+                pad32 = False,
+            )
+            self.modules += [mmp]
+        else:
+            norm = ExLlamaV2RMSNorm(
+                model = self,
+                key = cfg.arch.mmp_prefix + cfg.arch.mmp.keys["input_projection_norm"],
+                archparams = cfg.arch.mmp,
+            )
+            proj = ExLlamaV2Linear(
+                model = self,
+                key = cfg.arch.mmp_prefix + cfg.arch.mmp.keys["input_projection"],
+                has_bias = False,
+                in_features = cfg.vision_hidden_size,
+                out_features = cfg.hidden_size,
+                pad32 = False,
+                archparams = cfg.arch.mmp,
+                maybe_transpose = True,
+            )
+            self.modules += [norm, proj]
 
 
     def forward(self, **kwargs):
@@ -200,7 +260,7 @@ class ExLlamaV2VisionTower(ExLlamaV2):
             thw_grid
         )
 
-        attn_params = ExLlamaV2Attention.Params(non_causal_attn = True)
+        attn_params = ExLlamaV2Attention.Params(non_causal_attn = True, past_len = 0)
         if self.config.vision_window_size:
             attn_params.block_diag_layers = set([
                 l for l in range(self.config.vision_num_layers)
@@ -229,7 +289,7 @@ class ExLlamaV2VisionTower(ExLlamaV2):
             if idx == 0 or (n_device is not None and n_device != device and n_device >= 0):
                 hidden_states = safe_move_tensor(hidden_states, n_device, non_blocking = True)
 
-            if cos.device != hidden_states.device:
+            if cos is not None and cos.device != hidden_states.device:
                 cos = safe_move_tensor(cos, hidden_states.device)
                 sin = safe_move_tensor(sin, hidden_states.device)
 
@@ -241,12 +301,16 @@ class ExLlamaV2VisionTower(ExLlamaV2):
                     hidden_states.shape[2]
                 )
 
+            if self.pre_project_idx is not None and idx == len(self.modules) + self.pre_project_idx:
+                hidden_states = self.pre_project(cfg, hidden_states)
+
             hidden_states = module.forward(
                 hidden_states,
                 attn_params = attn_params,
-                **kwargs | {
+                **kwargs | ({
                     "alt_rope_embedding": (cos, sin),
-                }
+                    "patch_size": (p_height, p_width),
+                } if cos is not None else {})
             )
 
             if thw_grid is not None and isinstance(module, ExLlamaV2Attention):

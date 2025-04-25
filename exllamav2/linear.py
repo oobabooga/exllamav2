@@ -68,7 +68,8 @@ class ExLlamaV2Linear(ExLlamaV2Module):
         is_sub_module: bool = True,
         altpack_qkv: bool = False,
         normalize_unq: bool = False,
-        archparams = None
+        archparams = None,
+        maybe_transpose: bool = False
     ):
         super().__init__(model, key, archparams)
 
@@ -112,6 +113,7 @@ class ExLlamaV2Linear(ExLlamaV2Module):
 
         self.out_features_tp = None
 
+        self.maybe_transpose = maybe_transpose
 
     @torch.inference_mode
     def load(
@@ -171,6 +173,10 @@ class ExLlamaV2Linear(ExLlamaV2Module):
         # Load FP16 linear layer without bias, optionally quantize to Q4
 
         elif isinstance(w, nn.Parameter):
+            if self.maybe_transpose and \
+                w.data.shape[0] == self.in_features and w.data.shape[1] == self.out_features and \
+                self.in_features != self.out_features:
+                w = nn.Parameter(w.data.T)
             assert not self.has_bias, self.key + " has no bias tensor but bias is expected"
             # w = nn.Parameter(fpxify(w.data, 2, 3), requires_grad = False)
             if self.normalize_unq:

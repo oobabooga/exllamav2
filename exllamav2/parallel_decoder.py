@@ -30,7 +30,8 @@ class ExLlamaV2ParallelDecoder(ExLlamaV2Module):
         key: str,
         layer_idx: int,
         sliding_window: int = 0,
-        archparams = None
+        archparams = None,
+        rope_index: int = 0,
     ):
         super().__init__(model, key, archparams)
 
@@ -49,7 +50,8 @@ class ExLlamaV2ParallelDecoder(ExLlamaV2Module):
             layer_idx,
             has_norm = False,
             has_residual = False,
-            sliding_window = sliding_window
+            sliding_window = sliding_window,
+            rope_index = rope_index
         )
         self.mlp = ExLlamaV2MLP(
             model,

@@ -26,6 +26,7 @@ uintptr_t make_q_attn
     torch::Tensor layernorm,
     torch::Tensor layernorm_bias,
     bool layernorm_is_rms,
+    bool headnorm_is_rms,
     float norm_epsilon,
     uintptr_t q_q_proj,
     uintptr_t q_k_proj,
@@ -44,6 +45,7 @@ uintptr_t make_q_attn
     int max_seq_len,
     bool has_residual,
     int rope_style,
+    int sincos_size,
     torch::Tensor q_norm,
     torch::Tensor k_norm,
     torch::Tensor post_layernorm,
@@ -70,6 +72,7 @@ uintptr_t make_q_attn
         layernorm.is_meta() ? NULL : (half*) layernorm.data_ptr(),
         layernorm_bias.is_meta() ? NULL : (half*) layernorm_bias.data_ptr(),
         layernorm_is_rms,
+        headnorm_is_rms,
         norm_epsilon,
         qm_q_proj,
         qm_k_proj,
@@ -88,6 +91,7 @@ uintptr_t make_q_attn
         max_seq_len,
         has_residual,
         rope_style,
+        sincos_size,
         q_norm.is_meta() ? NULL : (half*) q_norm.data_ptr(),
         k_norm.is_meta() ? NULL : (half*) k_norm.data_ptr(),
         post_layernorm.is_meta() ? NULL : (half*) post_layernorm.data_ptr(),
@@ -377,7 +381,8 @@ void tp_attn_forward_paged_
                     num_kv_heads,
                     0, //past_len,
                     (int32_t*) past_lens[i].data_ptr(),
-                    rope_style == ROPE_STYLE_NEOX
+                    rope_style == ROPE_STYLE_NEOX,
+                    head_dim  // TODO: partial_rotary_factor
                 );
             }
         }
@@ -613,7 +618,8 @@ void tp_attn_forward_
                     num_kv_heads,
                     0, //past_len,
                     (int32_t*) past_len_tp[i].data_ptr(),
-                    rope_style == ROPE_STYLE_NEOX
+                    rope_style == ROPE_STYLE_NEOX,
+                    head_dim  // TODO: partial_rotary_factor
                 );
             }
         }

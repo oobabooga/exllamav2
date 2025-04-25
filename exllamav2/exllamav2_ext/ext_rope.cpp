@@ -32,12 +32,14 @@ void rope_
     TORCH_CHECK_DTYPE(x, kHalf);
     TORCH_CHECK_DTYPE(sin, kHalf);
     TORCH_CHECK_DTYPE(cos, kHalf);
-    TORCH_CHECK(head_dim == cos.size(-1), "cos table does not match head_dim");
-    TORCH_CHECK(head_dim == sin.size(-1), "sin table does not match head_dim");
+//    TORCH_CHECK(head_dim == cos.size(-1), "cos table does not match head_dim");
+//    TORCH_CHECK(head_dim == sin.size(-1), "sin table does not match head_dim");
+    TORCH_CHECK(cos.size(-1) == sin.size(-1), "sin table does not cos table");
     TORCH_CHECK_DTYPE_OPT(offsets, kInt);
 
     int batch_size = x.size(0);
     int rows_per_batch = x.numel() / head_dim / batch_size;
+    int sincos_size = cos.size(-1);
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -54,7 +56,8 @@ void rope_
         num_heads,
         past_len,
         offsets.device().is_meta() ? NULL : (int32_t*) offsets.data_ptr(),
-        neox_style
+        neox_style,
+        sincos_size
     );
 }
 

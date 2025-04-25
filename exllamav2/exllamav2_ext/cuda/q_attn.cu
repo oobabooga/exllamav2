@@ -86,6 +86,7 @@ QAttn::QAttn
     half* _layernorm,
     half* _layernorm_bias,
     bool _layernorm_is_rms,
+    bool _headnorm_is_rms,
     float _norm_epsilon,
     QMatrix* _q_proj,
     QMatrix* _k_proj,
@@ -104,6 +105,7 @@ QAttn::QAttn
     int _max_seq_len,
     bool _has_residual,
     int _rope_style,
+    int _sincos_size,
     half* _q_norm,
     half* _k_norm,
     half* _post_layernorm,
@@ -114,6 +116,7 @@ QAttn::QAttn
     layernorm(_layernorm),
     layernorm_bias(_layernorm_bias),
     layernorm_is_rms(_layernorm_is_rms),
+    headnorm_is_rms(_headnorm_is_rms),
     norm_epsilon(_norm_epsilon),
     q_proj(_q_proj),
     k_proj(_k_proj),
@@ -132,6 +135,7 @@ QAttn::QAttn
     max_seq_len(_max_seq_len),
     has_residual(_has_residual),
     rope_style(_rope_style),
+    sincos_size(_sincos_size),
     q_norm(_q_norm),
     k_norm(_k_norm),
     post_layernorm(_post_layernorm),
@@ -279,10 +283,10 @@ void QAttn::forward_cuda_1_run
     apply_loras_cuda(stream, cublas_handle, v_proj_lora, loras, v_proj, norm_state, temp_v, lora_temp, q_len * batch_size);
 
     if (q_norm)
-        head_norm_cuda(stream, temp_q, q_norm, NULL, temp_q, norm_epsilon, q_len * batch_size, num_heads, head_dim, graph, KernelLabels::Q_NORM);
+        head_norm_cuda(stream, temp_q, q_norm, NULL, temp_q, norm_epsilon, headnorm_is_rms, q_len * batch_size, num_heads, head_dim, graph, KernelLabels::Q_NORM);
 
     if (k_norm)
-        head_norm_cuda(stream, temp_k, k_norm, NULL, temp_k, norm_epsilon, q_len * batch_size, num_kv_heads, head_dim, graph, KernelLabels::K_NORM);
+        head_norm_cuda(stream, temp_k, k_norm, NULL, temp_k, norm_epsilon, headnorm_is_rms, q_len * batch_size, num_kv_heads, head_dim, graph, KernelLabels::K_NORM);
 
 //    rope_cuda(stream, temp_q, sin, cos, batch_size, q_len * num_heads,    head_dim, num_heads,    past_len, past_lens);
 //    rope_cuda(stream, temp_k, sin, cos, batch_size, q_len * num_kv_heads, head_dim, num_kv_heads, past_len, past_lens);
@@ -305,6 +309,7 @@ void QAttn::forward_cuda_1_run
             past_len,
             past_lens,
             rope_style == ROPE_STYLE_NEOX,
+            sincos_size,
             graph,
             KernelLabels::ROPE
         );

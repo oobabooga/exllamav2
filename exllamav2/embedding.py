@@ -169,7 +169,7 @@ class ExLlamaV2Embedding(ExLlamaV2Module):
                 if im.any():
                     for i in range(batch_size):
                         indexed_ids_ = input_ids[i][im[i]] - ie.first_index
-                        combined_embeddings[i][im[i]] = ie.embeddings[indexed_ids_]
+                        combined_embeddings[i][im[i]] = ie.embeddings[indexed_ids_].to(combined_embeddings.dtype)
 
             hidden_states = combined_embeddings
 

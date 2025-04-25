@@ -1,0 +1,272 @@
+name: Build Wheels & Release, Torch 2.7
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Release? 1 = yes, 0 = no'
+        default: '0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build_wheels:
+    name: ${{ matrix.os }} P${{ matrix.pyver }} C${{ matrix.cuda }} R${{ matrix.rocm }} T${{ matrix.torch }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: pwsh
+    strategy:
+      matrix:
+        include:
+
+        # Ubuntu 20.04 CUDA
+
+        # Python 3.10
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '11.8.0', rocm:    '', torch: '2.3.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.1.0', rocm:    '', torch: '2.3.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '11.8.0', rocm:    '', torch: '2.4.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.1.0', rocm:    '', torch: '2.4.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '11.8.0', rocm:    '', torch: '2.5.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.1.0', rocm:    '', torch: '2.5.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '11.8.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.4.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+
+        # Python 3.11
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '11.8.0', rocm:    '', torch: '2.3.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.1.0', rocm:    '', torch: '2.3.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '11.8.0', rocm:    '', torch: '2.4.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.1.0', rocm:    '', torch: '2.4.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '11.8.0', rocm:    '', torch: '2.5.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.1.0', rocm:    '', torch: '2.5.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '11.8.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.4.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+
+        # Python 3.12
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '11.8.0', rocm:    '', torch: '2.3.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.1.0', rocm:    '', torch: '2.3.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '11.8.0', rocm:    '', torch: '2.4.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.1.0', rocm:    '', torch: '2.4.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '11.8.0', rocm:    '', torch: '2.5.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.1.0', rocm:    '', torch: '2.5.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '11.8.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.4.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+
+        # Python 3.13
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13', cuda: '11.8.0', rocm:    '', torch: '2.5.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13', cuda: '12.1.0', rocm:    '', torch: '2.5.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13', cuda: '11.8.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13', cuda: '12.4.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.13', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+
+        # Windows 2022 CUDA
+
+        # Python 3.10
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '11.8.0', rocm:    '', torch: '2.3.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.1.0', rocm:    '', torch: '2.3.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '11.8.0', rocm:    '', torch: '2.4.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.1.0', rocm:    '', torch: '2.4.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '11.8.0', rocm:    '', torch: '2.5.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.1.0', rocm:    '', torch: '2.5.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '11.8.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.4.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.10', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+
+        # Python 3.11
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '11.8.0', rocm:    '', torch: '2.3.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.1.0', rocm:    '', torch: '2.3.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '11.8.0', rocm:    '', torch: '2.4.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.1.0', rocm:    '', torch: '2.4.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '11.8.0', rocm:    '', torch: '2.5.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.1.0', rocm:    '', torch: '2.5.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '11.8.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.4.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+
+        # Python 3.12
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '11.8.0', rocm:    '', torch: '2.3.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.1.0', rocm:    '', torch: '2.3.1', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '11.8.0', rocm:    '', torch: '2.4.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.1.0', rocm:    '', torch: '2.4.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '11.8.0', rocm:    '', torch: '2.5.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.1.0', rocm:    '', torch: '2.5.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '11.8.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.4.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.12', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+
+        # Python 3.13
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.13', cuda: '11.8.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+#          - { artname: 'wheel', os: windows-2022, pyver: '3.13', cuda: '12.4.0', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+          - { artname: 'wheel', os: windows-2022, pyver: '3.13', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+
+#         Ubuntu 20.04 ROCm
+
+        # ROCm 5.6
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '',       rocm: '5.6', torch: '2.2.2', cudaarch: ''                                    }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm: '5.6', torch: '2.2.2', cudaarch: ''                                    }
+
+        # ROCm 6.0
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '',       rocm: '6.0', torch: '2.3.1', cudaarch: ''                                    }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm: '6.0', torch: '2.3.1', cudaarch: ''                                    }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '',       rocm: '6.0', torch: '2.3.1', cudaarch: ''                                    }
+
+        # ROCm 6.1
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '',       rocm: '6.1', torch: '2.4.0', cudaarch: ''                                    }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm: '6.1', torch: '2.4.0', cudaarch: ''                                    }
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.12', cuda: '',       rocm: '6.1', torch: '2.4.0', cudaarch: ''                                    }
+
+         # sdist
+#          - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.3.1', cudaarch: ''                                    }
+
+         # Extra wheel for HF spaces
+#          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.10', cuda: '12.1.0', rocm:    '', torch: '2.2.2', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+
+      fail-fast: false
+
+    steps:
+      #Free disk space
+
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        if: runner.os == 'Linux'
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
+
+      # Setup Python
+
+      - uses: actions/checkout@v4
+
+      # Get version string from package
+
+      - name: Get version string
+        id: package_version
+        run: | 
+          $versionString = Get-Content $(Join-Path 'exllamav2' 'version.py') -raw
+          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"') 
+          {
+            Write-Output $('::notice file=build-wheels-release.yml,line=200,title=Package Version::Detected package version is: {0}' -f $Matches[1])
+            Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
+          }
+          else
+          {
+            Write-Output '::error file=build-wheels-release.yml,line=203::Could not parse version from exllamav2/version.py! You must upload wheels manually!'
+            Write-Output "PACKAGE_VERSION=None" >> "$env:GITHUB_OUTPUT"
+          }
+
+      # Install uv for easier python setup
+      - name: Install the latest version of uv and set the python version
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.pyver }}
+
+      # Install ROCm SDK, apparently needs to happen before setting up Python
+
+      - name: Build for ROCm
+        if: matrix.rocm != ''
+        shell: bash
+        run: |
+          # --- Install ROCm SDK
+
+          export ROCM_VERSION=${{ matrix.rocm }}
+          export TORCH_VERSION=${{ matrix.torch }}
+
+          [ ! -d /etc/apt/keyrings ] && sudo mkdir --parents --mode=0755 /etc/apt/keyrings
+          wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/$ROCM_VERSION focal main" | sudo tee --append /etc/apt/sources.list.d/rocm.list
+          echo -e 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600' | sudo tee /etc/apt/preferences.d/rocm-pin-600
+          
+          sudo apt update
+          sudo apt install rocm-hip-sdk -y
+          sudo apt clean -y
+
+          echo "/opt/rocm/bin" >> $GITHUB_PATH
+          echo "ROCM_PATH=/opt/rocm" >> $GITHUB_ENV
+          echo "ROCM_VERSION=$ROCM_VERSION" >> $GITHUB_ENV
+          echo "USE_ROCM=1" >> $GITHUB_ENV
+
+          # --- Install dependencies
+
+          uv pip install torch==${{ matrix.torch }} --index-url="https://download.pytorch.org/whl/rocm$ROCM_VERSION"
+          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors sentencepiece tokenizers numpy
+
+          # --- Build wheel 
+
+          python3 -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=+rocm${{ matrix.rocm }}-torch${{ matrix.torch }}"
+
+      # Build for CUDA
+      # TODO: Find specific sub-packages
+      - name: Install Windows CUDA ${{ matrix.cuda }}
+        uses: Jimver/cuda-toolkit@v0.2.23
+        id: cuda-toolkit-win
+        with:
+          cuda: "${{ matrix.cuda }}"
+          method: "network"
+        if: runner.os == 'Windows' && matrix.cuda != ''
+
+        # TODO: Find specific sub-packages
+      - name: Install Linux CUDA ${{ matrix.cuda }}
+        uses: Jimver/cuda-toolkit@v0.2.23
+        id: cuda-toolkit-Linux
+        with:
+          cuda: "${{ matrix.cuda }}"
+          linux-local-args: '["--toolkit"]'
+          method: "network"
+        if: runner.os != 'Windows' && matrix.cuda != ''
+
+      - name: Install CUDA build Dependencies
+        if: matrix.cuda != ''
+        run: |
+          git config --system core.longpaths true
+          $cudaVersion = '${{ matrix.cuda }}'
+          $cudaVersionPytorch = '${{ matrix.cuda }}'.Remove('${{ matrix.cuda }}'.LastIndexOf('.')).Replace('.','')
+          $pytorchIndexUrl = "https://download.pytorch.org/whl/cu$cudaVersionPytorch"
+
+          uv pip install torch==${{ matrix.torch }} --extra-index-url $pytorchIndexUrl
+          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors sentencepiece tokenizers numpy
+
+      - name: Build for CUDA
+        if: matrix.cuda != ''
+        run: |
+          # --- Build wheel
+          $BUILDTAG = "+cu$cudaVersionPytorch-torch${{ matrix.torch }}"
+          $env:BUILD_TARGET = "cuda"
+          $env:TORCH_CUDA_ARCH_LIST = '${{ matrix.cudaarch }}'
+          python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+
+      # Build sdist
+
+      - name: Build sdist
+        if: matrix.cuda == '' && matrix.rocm == ''
+        run: |
+          # --- Install dependencies
+
+          uv pip install torch==${{ matrix.torch }} --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors sentencepiece tokenizers numpy
+
+          # --- Build wheel
+           
+          $env:EXLLAMA_NOCOMPILE=1
+          python -m build -n
+
+      # Upload files
+
+      - name: Upload files to GitHub release
+        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
+        uses: svenstaro/upload-release-action@2.6.1
+        with:
+          file: ./dist/*.whl
+          tag: ${{ format('v{0}', steps.package_version.outputs.PACKAGE_VERSION) }}
+          file_glob: true
+          overwrite: true
+          release_name: ${{ steps.package_version.outputs.PACKAGE_VERSION }}

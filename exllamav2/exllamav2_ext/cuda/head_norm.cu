@@ -2,7 +2,7 @@
 #include "util.cuh"
 #include "compat.cuh"
 
-#define MAX_HEAD_DIM 128
+#define MAX_HEAD_DIM 256
 #define WARP_SIZE 32
 #define MAX_WARPS (MAX_HEAD_DIM / WARP_SIZE)
 
@@ -16,7 +16,8 @@ __global__ void head_norm_kernel
     const float r_dim,
     const int rows,
     const int num_heads,
-    const int head_dim
+    const int head_dim,
+    const bool rms
 )
 {
     int warp_id = threadIdx.x / WARP_SIZE;
@@ -37,62 +38,106 @@ __global__ void head_norm_kernel
     float itemf[2];
     float sum = 0.0f;
 
-    half2 h01 = ((half2*)x_ptr)[t];
-    float f0 = __half2float(__low2half(h01));
-    float f1 = __half2float(__high2half(h01));
-    f0 = fmaxf(-65504.0f, fminf(f0, 65504.0f));
-    f1 = fmaxf(-65504.0f, fminf(f1, 65504.0f));
-    itemf[0] = f0;
-    itemf[1] = f1;
-    sum += f0;
-    sum += f1;
+    // RMS Norm
 
-    // Shuffle to sum across lanes
+    if (rms)
+    {
+        half2 h01 = ((half2*)x_ptr)[t];
+        float f0 = __half2float(__low2half(h01));
+        float f1 = __half2float(__high2half(h01));
+        f0 = fmaxf(-65504.0f, fminf(f0, 65504.0f));
+        f1 = fmaxf(-65504.0f, fminf(f1, 65504.0f));
+        itemf[0] = f0;
+        itemf[1] = f1;
+        sum = fma(f0, f0, sum);
+        sum = fma(f1, f1, sum);
 
-    for(int offset = warpSize / 2; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
-    if (lane_id == 0) sums[warp_id] = sum;
-    __syncthreads();
+        // Shuffle to sum across lanes
 
-    // Sum of partial sums
+        for(int offset = warpSize / 2; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
+        if (lane_id == 0) sums[warp_id] = sum;
+        __syncthreads();
 
-    sum = 0.0f;
-    for(int i = 0; i < num_warps; ++i) sum += sums[i];
+        // Sum of partial sums
 
-    // Compute mean
+        sum = 0.0f;
+        for(int i = 0; i < num_warps; ++i) sum += sums[i];
 
-    float mean = sum * r_dim;
+        // Get 1/sqrt(variance)
 
-    // Compute square of distance to mean
+        float rsvar = rsqrtf(sum * r_dim + epsilon);
 
-    sum = 0.0f;
-    itemf[0] -= mean;
-    itemf[1] -= mean;
-    sum = fma(itemf[0], itemf[0], sum);
-    sum = fma(itemf[1], itemf[1], sum);
+        // Normalize x, scaling by w
 
-    // Shuffle to sum across lanes
+        half2 w01 = w_ptr2[t];
+        float n0 = itemf[0] * __half2float(__low2half(w01)) * rsvar;
+        float n1 = itemf[1] * __half2float(__high2half(w01)) * rsvar;
+        half2 nh = __halves2half2(__float2half_rn(n0), __float2half_rn(n1));
+        if (b) nh = __hadd2(nh, b_ptr2[t]);  // Optional bias
+        y_ptr2[t] = nh;
+    }
 
-    for(int offset = warpSize / 2; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
-    if (lane_id == 0) sums[warp_id] = sum;
-    __syncthreads();
+    // LayerNorm
 
-    // Sum of partial sums
+    else
+    {
+        half2 h01 = ((half2*)x_ptr)[t];
+        float f0 = __half2float(__low2half(h01));
+        float f1 = __half2float(__high2half(h01));
+        f0 = fmaxf(-65504.0f, fminf(f0, 65504.0f));
+        f1 = fmaxf(-65504.0f, fminf(f1, 65504.0f));
+        itemf[0] = f0;
+        itemf[1] = f1;
+        sum += f0;
+        sum += f1;
 
-    sum = 0.0f;
-    for(int i = 0; i < num_warps; ++i) sum += sums[i];
+        // Shuffle to sum across lanes
 
-    // Get 1/sqrt(variance)
+        for(int offset = warpSize / 2; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
+        if (lane_id == 0) sums[warp_id] = sum;
+        __syncthreads();
 
-    float rsvar = rsqrtf(sum * r_dim + epsilon);
+        // Sum of partial sums
 
-    // Normalize x, scaling by w
+        sum = 0.0f;
+        for(int i = 0; i < num_warps; ++i) sum += sums[i];
 
-    half2 w01 = w_ptr2[t];
-    float n0 = itemf[0] * __half2float(__low2half(w01)) * rsvar;
-    float n1 = itemf[1] * __half2float(__high2half(w01)) * rsvar;
-    half2 nh = __halves2half2(__float2half_rn(n0), __float2half_rn(n1));
-    if (b) nh = __hadd2(nh, b_ptr2[t]);  // Optional bias
-    y_ptr2[t] = nh;
+        // Compute mean
+
+        float mean = sum * r_dim;
+
+        // Compute square of distance to mean
+
+        sum = 0.0f;
+        itemf[0] -= mean;
+        itemf[1] -= mean;
+        sum = fma(itemf[0], itemf[0], sum);
+        sum = fma(itemf[1], itemf[1], sum);
+
+        // Shuffle to sum across lanes
+
+        for(int offset = warpSize / 2; offset > 0; offset /= 2) sum += __shfl_xor_sync(0xffffffff, sum, offset);
+        if (lane_id == 0) sums[warp_id] = sum;
+        __syncthreads();
+
+        // Sum of partial sums
+
+        sum = 0.0f;
+        for(int i = 0; i < num_warps; ++i) sum += sums[i];
+
+        // Get 1/sqrt(variance)
+
+        float rsvar = rsqrtf(sum * r_dim + epsilon);
+
+        // Normalize x, scaling by w
+
+        half2 w01 = w_ptr2[t];
+        float n0 = itemf[0] * __half2float(__low2half(w01)) * rsvar;
+        float n1 = itemf[1] * __half2float(__high2half(w01)) * rsvar;
+        half2 nh = __halves2half2(__float2half_rn(n0), __float2half_rn(n1));
+        if (b) nh = __hadd2(nh, b_ptr2[t]);  // Optional bias
+        y_ptr2[t] = nh;
+    }
 }
 
 void head_norm_cuda
@@ -103,6 +148,7 @@ void head_norm_cuda
     const half* b,
     half* y,
     const float epsilon,
+    bool rms,
     const int rows,
     const int num_heads,
     const int head_dim,
@@ -117,7 +163,7 @@ void head_norm_cuda
 
     float r_dim = 1.0f / (float) head_dim;
 
-    head_norm_kernel<<<gridDim, blockDim, 0, stream>>>(x, w, b, y, epsilon, r_dim, rows, num_heads, head_dim);
+    head_norm_kernel<<<gridDim, blockDim, 0, stream>>>(x, w, b, y, epsilon, r_dim, rows, num_heads, head_dim, rms);
     if (graph) graph->attach_label(stream, label, 0);
 }
 

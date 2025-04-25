@@ -12,9 +12,9 @@ if TYPE_CHECKING:
 def get_rope_params_su(
     device: torch.Device,
     cfg: ExLlamaV2Config,
+    base: float
 ):
-    head_dim = cfg.head_dim
-    base = cfg.rotary_embedding_base
+    head_dim = int(cfg.head_dim * cfg.partial_rotary_factor)
     if cfg.scale_alpha_value and cfg.scale_alpha_value != 1.0:
         base *= cfg.scale_alpha_value ** (cfg.head_dim / (cfg.head_dim - 2))
 
@@ -35,9 +35,9 @@ def get_rope_params_su(
 def get_rope_params_llama3(
     device: torch.Device,
     cfg: ExLlamaV2Config,
+    base: float
 ):
-    head_dim = cfg.head_dim
-    base = cfg.rotary_embedding_base
+    head_dim = int(cfg.head_dim * cfg.partial_rotary_factor)
     if cfg.scale_alpha_value and cfg.scale_alpha_value != 1.0:
         base *= cfg.scale_alpha_value ** (cfg.head_dim / (cfg.head_dim - 2))
 
@@ -80,9 +80,10 @@ def get_rope_params_llama3(
 def get_rope_params_yarn(
     device: torch.Device,
     cfg: ExLlamaV2Config,
+    base: float,
 ):
-    head_dim = cfg.head_dim
-    base = cfg.rotary_embedding_base
+    head_dim = int(cfg.head_dim * cfg.partial_rotary_factor)
+
     if cfg.scale_alpha_value and cfg.scale_alpha_value != 1.0:
         base *= cfg.scale_alpha_value ** (cfg.head_dim / (cfg.head_dim - 2))
 
@@ -91,9 +92,7 @@ def get_rope_params_yarn(
     # Only activate if longer than original ctx
     if cfg.max_seq_len > cfg.yarn_rope_original_max_position_embeddings:
 
-        partial_rotary_factor = 1.0  # Placeholder, assume no partial_rotary_factor in config.
-        dim = int(head_dim * partial_rotary_factor)
-
+        head_dim = int(cfg.head_dim * cfg.partial_rotary_factor)
         factor = cfg.yarn_rope_factor
 
         # Sets the attention factor as suggested in the paper
@@ -126,14 +125,14 @@ def get_rope_params_yarn(
 
         # Note on variable naming: "interpolation" comes from the original technique, where we interpolate the position IDs
         # to expand the possible context length. In other words, interpolation = apply scaling factor.
-        pos_freqs = base ** (torch.arange(0, dim, 2).float().to(device) / dim)
+        pos_freqs = base ** (torch.arange(0, head_dim, 2).float().to(device) / head_dim)
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (factor * pos_freqs)
 
-        low, high = find_correction_range(beta_fast, beta_slow, dim, base, yarn_max_position_embeddings)
+        low, high = find_correction_range(beta_fast, beta_slow, head_dim, base, yarn_max_position_embeddings)
 
         # Get n-dimensional rotational scaling corrected for extrapolation
-        inv_freq_extrapolation_factor = 1 - linear_ramp_factor(low, high, dim // 2).float().to(device)
+        inv_freq_extrapolation_factor = 1 - linear_ramp_factor(low, high, head_dim // 2).float().to(device)
         inv_freq = (
                 inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
                 + inv_freq_extrapolation * inv_freq_extrapolation_factor
@@ -149,11 +148,12 @@ def get_rope_params_yarn(
 def get_rope_params_default(
     device: torch.Device,
     cfg: ExLlamaV2Config,
+    base: float,
 ):
-    head_dim = cfg.head_dim
-    base = cfg.rotary_embedding_base
+    head_dim = int(cfg.head_dim * cfg.partial_rotary_factor)
+
     if cfg.scale_alpha_value and cfg.scale_alpha_value != 1.0:
-        base *= cfg.scale_alpha_value ** (cfg.head_dim / (cfg.head_dim - 2))
+        base *= cfg.scale_alpha_value ** (head_dim / (head_dim - 2))
 
     inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device = device).float() / head_dim))
     return inv_freq, 1.0
@@ -162,15 +162,16 @@ def get_rope_params_default(
 def get_rope_params(
     device: torch.Device,
     cfg: ExLlamaV2Config,
+    base: float,
 ):
     if cfg.alt_rope_method == "su":
-        inv_freq, scaling_factor = get_rope_params_su(device, cfg)
+        inv_freq, scaling_factor = get_rope_params_su(device, cfg, base)
     elif cfg.alt_rope_method == "llama3":
-        inv_freq, scaling_factor = get_rope_params_llama3(device, cfg)
+        inv_freq, scaling_factor = get_rope_params_llama3(device, cfg, base)
     elif cfg.alt_rope_method == "yarn":
-        inv_freq, scaling_factor = get_rope_params_yarn(device, cfg)
+        inv_freq, scaling_factor = get_rope_params_yarn(device, cfg, base)
     else:
-        inv_freq, scaling_factor = get_rope_params_default(device, cfg)
+        inv_freq, scaling_factor = get_rope_params_default(device, cfg, base)
 
     if cfg.arch.lm.rope_freq_half:
         inv_freq = inv_freq.half()
