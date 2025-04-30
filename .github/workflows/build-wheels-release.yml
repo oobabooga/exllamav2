@@ -21,18 +21,16 @@ jobs:
         include:
 
         # Ubuntu 22.04 CUDA
-         - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.4.1', rocm:    '', torch: '2.7.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
-         - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.0', rocm:    '', torch: '2.7.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+         - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.4.1', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
 
         # Windows 2022 CUDA
-         - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.4.1', rocm:    '', torch: '2.7.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
-         - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.8.0', rocm:    '', torch: '2.7.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
+         - { artname: 'wheel', os: windows-2022, pyver: '3.11', cuda: '12.4.1', rocm:    '', torch: '2.6.0', cudaarch: '6.0 6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX' }
 
         # Ubuntu 22.04 ROCm
-         - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm: '6.1', torch: '2.7.0', cudaarch: ''                                    }
+         - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm: '6.1', torch: '2.6.0', cudaarch: ''                                    }
 
          # sdist
-         - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.7.0', cudaarch: ''                                    }
+         - { artname: 'sdist', os: ubuntu-22.04, pyver: '3.11', cuda: '',       rocm:    '', torch: '2.6.0', cudaarch: ''                                    }
 
     defaults:
       run:
